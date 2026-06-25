@@ -4,7 +4,7 @@ No Bullshit Claw: a small daemon that puts a [Swival](https://swival.dev/) agent
 
 You text it. It does the work and texts back. You can also tell it to do things on a schedule ("every weekday at 9, summarize the git log") and cancel those later.
 
-## Prerequisites
+## Dependencies
 
 - Python 3.13+ and [uv](https://docs.astral.sh/uv/).
 - A running model. Anything Swival supports works; the quickest is to use [LM Studio](https://lmstudio.ai/) with a tool-calling model loaded.
