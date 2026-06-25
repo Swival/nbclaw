@@ -1,4 +1,4 @@
-# nbclaw
+# NBClaw
 
 No Bullshit Claw: a small daemon that puts a [Swival](https://swival.dev/) agent  n the other end of a Signal conversation.
 
