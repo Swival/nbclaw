@@ -13,7 +13,7 @@ Plain text is sent to the agent. Slash commands:
 
 /help              show this help
 /status            model, uptime, active crons
-/reset             forget this conversation's context
+/clear             forget this conversation's context
 
 Scheduling — just say it in plain English after /cron:
   /cron every weekday at 9am summarize my git log in ~/src/app
