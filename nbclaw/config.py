@@ -117,9 +117,7 @@ class Config:
         may be a real project, so there we only touch an AGENTS.md that doesn't
         exist yet or that carries our marker (i.e. a previous run wrote it).
         """
-        if self.workspace_dir is None:
-            return True
-        if not path.exists():
+        if self.workspace_dir is None or not path.exists():
             return True
         try:
             first_line = path.read_text().split("\n", 1)[0]

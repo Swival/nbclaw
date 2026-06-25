@@ -51,6 +51,4 @@ def parse_cron_add(args: str) -> tuple[str, str, str]:
     schedule = " ".join(head_parts[1:])
     if not prompt:
         raise CronAddError("the prompt is empty")
-    if not schedule:
-        raise CronAddError("the schedule is empty")
     return name, schedule, prompt
