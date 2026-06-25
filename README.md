@@ -144,3 +144,13 @@ Everything lives under `state_dir` (default `~/.nbclaw`):
 ## Environment variables
 
 - `NBCLAW_LOG` sets the log level (default `INFO`; try `DEBUG`).
+
+## But why this since there's already XYZ?
+
+NBClaw uses Swival as a Python library, so the CLI isn't required. This lets it work well even with small, local models and short context windows. No large models needed.
+
+More importantly, NBClaw is ridiculously lightweight and incredibly easy to install and use.
+
+No bloat. It intentionally ships with a minimal set of tools, but it gets the job done. And if you need more, you can extend it with skills, MCP servers, and whatever else fits your workflow.
+
+It may not be for you, but this is the minimal claw-style agent I always wanted.
