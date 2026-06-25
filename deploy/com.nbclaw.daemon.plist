@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd template for running nbclaw 24/7 on macOS.
+
+  Edit the paths and phone numbers below, then:
+    cp deploy/com.nbclaw.daemon.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.nbclaw.daemon.plist
+
+  KeepAlive restarts nbclaw if it ever exits. It assumes signal-cli and the
+  model server are already running (run those as their own launchd jobs).
+
+  The equivalent command line for a Linux systemd user unit is:
+    ExecStart=/opt/homebrew/bin/uv run --project %h/src/nbclaw nbclaw --config %h/.nbclaw/nbclaw.toml
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.nbclaw.daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/uv</string>
+        <string>run</string>
+        <string>--project</string>
+        <string>/Users/YOU/src/nbclaw</string>
+        <string>nbclaw</string>
+        <string>--config</string>
+        <string>/Users/YOU/.nbclaw/nbclaw.toml</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/YOU/src/nbclaw</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>NBCLAW_LOG</key>
+        <string>INFO</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/YOU/.nbclaw/nbclaw.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOU/.nbclaw/nbclaw.log</string>
+</dict>
+</plist>

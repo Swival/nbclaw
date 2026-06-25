@@ -1,0 +1,46 @@
+# nbclaw configuration. Copy to nbclaw.toml and edit.
+# Run with: uv run nbclaw --config nbclaw.toml
+# CLI flags override anything set here.
+
+# --- Signal -----------------------------------------------------------
+signal_url = "http://127.0.0.1:3080"
+
+# Senders allowed to drive the agent (your phone number(s) and/or UUIDs).
+# With this empty and allow_all unset, ALL messages are ignored (fail closed).
+allow = ["+33YOURPHONE"]
+# allow_all = false        # dangerous: let anyone in. Testing only.
+
+# Number to message when the daemon starts (optional). Note-to-Self works.
+notify = "+33YOURPHONE"
+
+# --- Model / provider -------------------------------------------------
+provider = "lmstudio"           # lmstudio, generic, llamacpp, openrouter, ...
+model = "ornith-1.0-9b"
+# base_url = "http://127.0.0.1:1234"   # only if not the provider default
+# api_key = "..."                       # only for providers that need it
+
+# --- Agent behaviour --------------------------------------------------
+# safe = false   # true => read-only agent (no shell, no edits)
+max_turns = 60
+
+# State and the agent's working directory.
+state_dir = "~/.nbclaw"
+# workspace_dir = "~/.nbclaw/workspace"
+
+# Grace period (seconds) for an in-flight job to finish when the daemon is
+# asked to stop, before it is abandoned.
+# shutdown_timeout = 20.0
+
+# --- MCP servers (swival format) --------------------------------------
+# [mcp_servers.fetch]
+# command = "uvx"
+# args = ["mcp-server-fetch"]
+#
+# [mcp_servers.remote]
+# url = "https://api.example.com/mcp"
+# headers = { Authorization = "Bearer TOKEN" }
+
+# --- Extra swival.Session kwargs, passed through verbatim -------------
+# [swival]
+# temperature = 0.2
+# reasoning_effort = "medium"
