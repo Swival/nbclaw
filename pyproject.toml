@@ -20,9 +20,6 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["nbclaw"]
 
-[tool.uv.sources]
-swival = { path = "../swival", editable = true }
-
 [dependency-groups]
 dev = [
     "pytest>=8.0.0",
