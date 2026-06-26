@@ -1,6 +1,6 @@
 [project]
 name = "nbclaw"
-version = "0.1.1"
+version = "0.1.2"
 description = "No Bullshit Claw — a 24/7 Signal-driven Swival agent daemon"
 readme = "README.md"
 requires-python = ">=3.13"
@@ -19,6 +19,16 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["nbclaw"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "nbclaw/",
+    "tests/",
+    "deploy/",
+    "README.md",
+    "LICENSE",
+    "nbclaw.toml.example",
+]
 
 [dependency-groups]
 dev = [
