@@ -85,6 +85,23 @@ class SignalClient:
     async def send(self, conv: Conversation, message: str) -> None:
         await self._rpc("send", conv.send_params(message))
 
+    async def send_reaction(self, msg: IncomingMessage, emoji: str = "👀") -> None:
+        """React to an incoming message. Best-effort, like typing indicators."""
+        target_author = msg.source or msg.source_uuid
+        if not target_author or not msg.timestamp:
+            log.debug("cannot react: missing target author or timestamp")
+            return
+        params = {
+            "emoji": emoji,
+            "targetAuthor": target_author,
+            "targetTimestamp": msg.timestamp,
+            **msg.conversation.routing_params(),
+        }
+        try:
+            await self._rpc("sendReaction", params)
+        except Exception as exc:  # reactions are best-effort
+            log.debug("sendReaction failed: %s", exc)
+
     async def send_typing(self, conv: Conversation, *, stop: bool = False) -> None:
         params = {"stop": stop, **conv.routing_params()}
         try:

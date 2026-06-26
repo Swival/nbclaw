@@ -20,12 +20,16 @@ from nbclaw.signal_client import Conversation, IncomingMessage
 class FakeSignal:
     def __init__(self):
         self.sent: list[tuple[str, str]] = []  # (conv.key, message)
+        self.reactions: list[tuple[str, int, str]] = []  # (author, timestamp, emoji)
 
     async def version(self):
         return "fake"
 
     async def send(self, conv, message):
         self.sent.append((conv.key, message))
+
+    async def send_reaction(self, msg, emoji="👀"):
+        self.reactions.append((msg.source or msg.source_uuid, msg.timestamp, emoji))
 
     async def send_typing(self, conv, *, stop=False):
         pass
@@ -107,6 +111,20 @@ def test_chat_message_is_queued(tmp_path):
     job = d.queue.get_nowait()
     assert job.mode == "chat"
     assert job.prompt == "what is 2+2?"
+
+
+def test_received_message_gets_reaction_before_dispatch(tmp_path):
+    class OneMessageSignal(FakeSignal):
+        async def events(self):
+            yield incoming("what is 2+2?")
+
+    d = make_daemon(tmp_path)
+    d.signal = OneMessageSignal()
+
+    asyncio.run(d._consume_events())
+
+    assert d.signal.reactions == [("+15550000001", 1, "👀")]
+    assert d.queue.qsize() == 1
 
 
 class FakeAgent:

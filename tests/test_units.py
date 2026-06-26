@@ -17,7 +17,7 @@ from nbclaw.scheduler import (
     slugify,
     validate_schedule,
 )
-from nbclaw.signal_client import Conversation, _parse_sse, _to_message
+from nbclaw.signal_client import Conversation, SignalClient, _parse_sse, _to_message
 
 
 # --- duration / schedule parsing -------------------------------------
@@ -227,6 +227,44 @@ def test_to_message_direct():
     assert msg.conversation.group_id is None
 
 
+def test_send_reaction_direct(monkeypatch):
+    env = {
+        "params": {
+            "envelope": {
+                "sourceNumber": "+33600000000",
+                "sourceUuid": "uuid-1",
+                "timestamp": 123,
+                "dataMessage": {"message": "hello there"},
+            }
+        }
+    }
+    msg = _to_message(env)
+    client = SignalClient("http://signal.local")
+    calls = []
+
+    async def fake_rpc(method, params=None):
+        calls.append((method, params))
+        return {}
+
+    monkeypatch.setattr(client, "_rpc", fake_rpc)
+    try:
+        asyncio.run(client.send_reaction(msg, "👀"))
+    finally:
+        asyncio.run(client.aclose())
+
+    assert calls == [
+        (
+            "sendReaction",
+            {
+                "emoji": "👀",
+                "targetAuthor": "+33600000000",
+                "targetTimestamp": 123,
+                "recipient": ["+33600000000"],
+            },
+        )
+    ]
+
+
 def test_to_message_group():
     env = {
         "params": {
@@ -241,6 +279,46 @@ def test_to_message_group():
     }
     msg = _to_message(env)
     assert msg.conversation.group_id == "GRP=="
+
+
+def test_send_reaction_group(monkeypatch):
+    env = {
+        "params": {
+            "envelope": {
+                "sourceNumber": "+1",
+                "timestamp": 456,
+                "dataMessage": {
+                    "message": "in group",
+                    "groupInfo": {"groupId": "GRP=="},
+                },
+            }
+        }
+    }
+    msg = _to_message(env)
+    client = SignalClient("http://signal.local")
+    calls = []
+
+    async def fake_rpc(method, params=None):
+        calls.append((method, params))
+        return {}
+
+    monkeypatch.setattr(client, "_rpc", fake_rpc)
+    try:
+        asyncio.run(client.send_reaction(msg))
+    finally:
+        asyncio.run(client.aclose())
+
+    assert calls == [
+        (
+            "sendReaction",
+            {
+                "emoji": "👀",
+                "targetAuthor": "+1",
+                "targetTimestamp": 456,
+                "groupId": "GRP==",
+            },
+        )
+    ]
 
 
 def test_to_message_ignores_receipts():

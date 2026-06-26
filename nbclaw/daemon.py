@@ -169,6 +169,7 @@ class Daemon:
                 log.info("ignoring message from unauthorized sender %s", msg.source)
                 continue
             log.info("[%s] %s", msg.conversation.key, msg.text)
+            await self.signal.send_reaction(msg)
             try:
                 await self._dispatch(msg)
             except Exception as exc:
