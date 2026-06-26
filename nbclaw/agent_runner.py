@@ -21,6 +21,22 @@ from swival import AgentError, Result, Session
 log = logging.getLogger("nbclaw.agent")
 
 
+def _setup_and_report_mcp(session: Session) -> None:
+    """Force swival's lazy setup and log how many MCP tools loaded.
+
+    swival defers MCP startup to the first run/ask. Doing it eagerly at session
+    creation means a misconfigured or unreachable server fails loudly here, in
+    the daemon log, instead of silently on someone's first message.
+    """
+    try:
+        session._setup()
+        manager = session._mcp_manager
+        count = len(manager.list_tools()) if manager is not None else 0
+        log.info("MCP servers ready: %d tool(s) available", count)
+    except Exception as exc:
+        log.error("MCP server startup failed: %s", exc)
+
+
 def _safe_close(session: Session) -> None:
     try:
         session.close()
@@ -38,6 +54,11 @@ class AgentRunner:
         if session is None:
             log.info("creating session for %s", key)
             session = Session(**self._kwargs)
+            # swival starts MCP servers lazily inside the first run/ask. Trigger
+            # it now so any spawn failure surfaces here, and log the tool count
+            # as visible confirmation the servers actually came up.
+            if self._kwargs.get("mcp_servers"):
+                _setup_and_report_mcp(session)
             self._sessions[key] = session
         return session
 

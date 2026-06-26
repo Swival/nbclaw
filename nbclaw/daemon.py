@@ -85,6 +85,18 @@ class Daemon:
             log.error("cannot reach signal-cli at %s: %s", self.config.signal_url, exc)
             raise SystemExit(1)
 
+        if self.config.mcp_servers:
+            # MCP servers are spawned lazily, per conversation, on the first
+            # message (swival starts them in Session._setup). Log them here so
+            # there's confirmation at boot that the config was picked up — the
+            # actual "MCP <name> N tool(s)" line lands on the first message.
+            log.info(
+                "MCP servers configured (spawned on first message): %s",
+                ", ".join(self.config.mcp_servers),
+            )
+        else:
+            log.info("no MCP servers configured")
+
         if not self.config.allow and not self.config.allow_all:
             log.warning(
                 "no --allow senders configured and --allow-all not set: "

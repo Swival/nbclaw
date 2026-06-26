@@ -117,9 +117,9 @@ max_turns = 60
 state_dir = "~/.nbclaw"
 
 # MCP servers, in swival's format.
-[mcp_servers.fetch]
-command = "uvx"
-args = ["mcp-server-fetch"]
+[mcp_servers.chrome]
+command = "npx"
+args = ["-y", "chrome-devtools-mcp@latest", "--isolated", "--no-usage-statistics", "--no-performance-crux"]
 
 # Anything here is forwarded verbatim to swival.Session.
 [swival]
