@@ -45,6 +45,20 @@ By default the agent runs in **autonomous** mode: it can run shell commands and 
 - `--safe` makes the agent read-only: no shell commands, no file edits. Good for a "just answer questions" bot.
 - In a group chat, authorization is checked against the **sender**, but the reply goes to the **whole group**. So one allowed member can make the bot post agent output to everyone in that group. Keep the allowlist to people you trust with that, or only message the bot in 1:1 chats / Note to Self.
 
+The allowlist controls *who* can drive the agent. It does nothing to limit *what* the agent can reach once it's driven. For that, put the whole thing in a sandbox — see below.
+
+## Sandboxing with nono
+
+The agent runs shell commands and edits files with the privileges of the account nbclaw runs as. The workspace is where it starts, not a fence. If you want a hard boundary — so a confused model, a bad cron, or a prompt-injected web page can't wander off and read your SSH keys or wipe a directory — run the daemon inside [nono](https://nono.sh).
+
+nono is a capability-based sandbox that enforces filesystem and network access at the kernel level: Landlock on Linux, Seatbelt on macOS. The denial happens in the kernel, not in the agent's own guards, so it holds even if the model misbehaves.
+
+### Running it 24/7 under nono
+
+The launchd and systemd setups in [Running 24/7](#running-247) work the same way — just make the wrapper the program they launch. In the plist, the `ProgramArguments` become `nono run … -- …/.venv/bin/nbclaw …` instead of bare nbclaw. One wrinkle: launchd and systemd don't expand `$TMPDIR`, so pass a literal temp path there (the value of `echo $TMPDIR`).
+
+For the full picture of nono's flags, profiles, and credential brokering, see Swival's [nono guide](https://swival.dev/pages/nono.html).
+
 ## Commands
 
 Send these as Signal messages. Anything not starting with `/` goes to the agent.
@@ -133,6 +147,8 @@ launchctl load ~/Library/LaunchAgents/com.nbclaw.daemon.plist
 ```
 
 On Linux, a user systemd unit does the same job; the plist documents the same command line.
+
+To keep the daemon sandboxed while it runs unattended, wrap that command in `nono run` — see [Sandboxing with nono](#sandboxing-with-nono).
 
 ## State
 
