@@ -191,7 +191,7 @@ class Daemon:
             await self.signal.send(conv, commands.HELP_TEXT)
         elif cmd == "status":
             await self.signal.send(conv, self._status_text())
-        elif cmd in ("clear", "reset"):
+        elif cmd in ("clear", "reset", "new"):
             had = self.agent.reset(conv.key)
             await self.signal.send(
                 conv, "context cleared." if had else "no context to clear."

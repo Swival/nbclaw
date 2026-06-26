@@ -76,6 +76,25 @@ def test_status_command(tmp_path):
     assert "model: ornith-1.0-9b" in d.signal.last
 
 
+def test_clear_reset_and_new_aliases(tmp_path):
+    class ResetAgent:
+        def __init__(self):
+            self.reset_keys = []
+
+        def reset(self, key):
+            self.reset_keys.append(key)
+            return True
+
+    d = make_daemon(tmp_path)
+    d.agent = ResetAgent()
+
+    for command in ("/clear", "/reset", "/new"):
+        asyncio.run(d._dispatch(incoming(command)))
+
+    assert d.agent.reset_keys == ["user:+15550000001"] * 3
+    assert d.signal.last == "context cleared."
+
+
 def test_cron_lifecycle(tmp_path):
     d = make_daemon(tmp_path)
 
