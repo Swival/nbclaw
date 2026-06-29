@@ -22,6 +22,12 @@ import httpx
 
 log = logging.getLogger("nbclaw.signal")
 
+# A single SSE event is one JSON-RPC notification; signal-cli emits each on one
+# ``data:`` line. These bounds stop an unterminated event (data lines that never
+# reach the blank separator) from accumulating in memory without limit.
+_MAX_SSE_EVENT_BYTES = 1024 * 1024
+_MAX_SSE_EVENT_LINES = 4096
+
 
 @dataclass(frozen=True)
 class Conversation:
@@ -139,11 +145,13 @@ class SignalClient:
 async def _parse_sse(resp: httpx.Response):
     """Parse an SSE stream, yielding the decoded JSON of each ``data:`` event."""
     data_lines: list[str] = []
+    data_bytes = 0
     async for line in resp.aiter_lines():
         if line == "":
             if data_lines:
                 raw = "\n".join(data_lines)
                 data_lines = []
+                data_bytes = 0
                 try:
                     yield json.loads(raw)
                 except json.JSONDecodeError:
@@ -152,7 +160,14 @@ async def _parse_sse(resp: httpx.Response):
         if line.startswith(":"):
             continue  # comment / keepalive
         if line.startswith("data:"):
-            data_lines.append(line[5:].lstrip())
+            data = line[5:].lstrip()
+            data_bytes += len(data.encode("utf-8"))
+            if (
+                data_bytes > _MAX_SSE_EVENT_BYTES
+                or len(data_lines) >= _MAX_SSE_EVENT_LINES
+            ):
+                raise ValueError("SSE event too large")
+            data_lines.append(data)
         # other SSE fields (event:, id:) are ignored
 
 

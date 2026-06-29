@@ -68,6 +68,8 @@ Send these as Signal messages. Anything not starting with `/` goes to the agent.
 | `/help`                 | List the commands.                    |
 | `/status`               | Model, mode, uptime, number of crons. |
 | `/clear`                | Forget this conversation's context.   |
+| `/queue`                | Show running and queued work.         |
+| `/cancel [id\|all]`     | Cancel queued work.                   |
 | `/cron <plain English>` | Schedule a task, described naturally. |
 | `/cron list`            | Show scheduled tasks.                 |
 | `/cron del <name>`      | Cancel a scheduled task.              |

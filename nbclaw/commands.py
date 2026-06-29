@@ -14,6 +14,8 @@ Plain text is sent to the agent. Slash commands:
 /help              show this help
 /status            model, uptime, active crons
 /clear             forget this conversation's context
+/queue             show running and queued work
+/cancel [id|all]   cancel queued work
 
 Scheduling — just say it in plain English after /cron:
   /cron every weekday at 9am summarize my git log in ~/src/app

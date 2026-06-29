@@ -19,15 +19,19 @@ import asyncio
 import logging
 import signal
 import time
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 
 from . import commands, nl_schedule
 from .agent_runner import AgentRunner
 from .config import Config
-from .scheduler import Scheduler, fmt_time, validate_schedule
+from .scheduler import CronJob, Scheduler, fmt_time, validate_schedule
 from .signal_client import Conversation, IncomingMessage, SignalClient
 
 log = logging.getLogger("nbclaw")
+
+MAX_REPLY_CHARS = 3500
+_REPLY_CHUNK_PREFIX_RESERVE = 64
 
 
 def _split_command(text: str) -> tuple[str, str]:
@@ -36,6 +40,40 @@ def _split_command(text: str) -> tuple[str, str]:
     verb = parts[0].lower() if parts else ""
     rest = parts[1] if len(parts) > 1 else ""
     return verb, rest
+
+
+def split_reply(text: str, max_chars: int = MAX_REPLY_CHARS) -> list[str]:
+    """Split a long Signal reply into numbered chunks."""
+    if len(text) <= max_chars:
+        return [text]
+    body_limit = max_chars - _REPLY_CHUNK_PREFIX_RESERVE
+    if body_limit < 1:
+        raise ValueError("max_chars is too small")
+
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > body_limit:
+        split_at = remaining.rfind("\n", 0, body_limit + 1)
+        if split_at < body_limit // 2:
+            split_at = remaining.rfind(" ", 0, body_limit + 1)
+        if split_at < body_limit // 2:
+            split_at = body_limit
+        chunk = remaining[:split_at].rstrip()
+        if not chunk:
+            chunk = remaining[:body_limit]
+            split_at = body_limit
+        chunks.append(chunk)
+        remaining = remaining[split_at:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+
+    total = len(chunks)
+    return [f"({i}/{total}) {chunk}" for i, chunk in enumerate(chunks, 1)]
+
+
+def _truncate_prompt(prompt: str) -> str:
+    """Shorten a prompt for a one-line summary."""
+    return prompt if len(prompt) <= 60 else prompt[:57] + "…"
 
 
 @dataclass
@@ -51,6 +89,9 @@ class Job:
     # The fired cron's ``created`` stamp, so finalization targets that exact job
     # even if the name was deleted and re-added while this sat in the queue.
     cron_created: float | None = None
+    id: int = 0
+    queued_at: float = field(default_factory=time.time)
+    started_at: float | None = None
 
 
 class Daemon:
@@ -61,8 +102,17 @@ class Daemon:
         self.scheduler = Scheduler(config.crons_path())
         # ``None`` is the shutdown sentinel that lets the worker drain and exit.
         self.queue: asyncio.Queue[Job | None] = asyncio.Queue()
+        self.current_job: Job | None = None
+        self._next_job_id = 1
         self.start_time = time.time()
         self._stop = asyncio.Event()
+
+    async def _enqueue(self, job: Job) -> Job:
+        job.id = self._next_job_id
+        self._next_job_id += 1
+        job.queued_at = time.time()
+        await self.queue.put(job)
+        return job
 
     # --- lifecycle -----------------------------------------------------
     async def run(self) -> None:
@@ -179,7 +229,7 @@ class Daemon:
     async def _dispatch(self, msg: IncomingMessage) -> None:
         text = msg.text
         if not text.startswith("/"):
-            await self.queue.put(Job(msg.conversation, text, "chat"))
+            await self._enqueue(Job(msg.conversation, text, "chat"))
             return
         await self._handle_command(msg.conversation, text)
 
@@ -196,6 +246,10 @@ class Daemon:
             await self.signal.send(
                 conv, "context cleared." if had else "no context to clear."
             )
+        elif cmd == "queue":
+            await self.signal.send(conv, self._queue_text(conv))
+        elif cmd == "cancel":
+            await self.signal.send(conv, self._cancel_text(conv, rest))
         elif cmd == "cron":
             await self._handle_cron(conv, rest)
         else:
@@ -207,21 +261,22 @@ class Daemon:
         sub, sub_rest = _split_command(rest)
 
         if sub in ("list", "ls", ""):
-            await self.signal.send(conv, self._cron_list_text())
+            await self.signal.send(conv, self._cron_list_text(conv))
         elif sub in ("del", "rm", "delete", "cancel"):
             name = sub_rest.strip()
-            ok = self.scheduler.remove(name)
-            await self.signal.send(
-                conv, f"cancelled cron '{name}'." if ok else f"no cron named '{name}'."
-            )
+            if await self._lookup_cron(conv, name) is None:
+                return
+            self.scheduler.remove(name)
+            await self.signal.send(conv, f"cancelled cron '{name}'.")
         elif sub == "run":
             name = sub_rest.strip()
-            job = self.scheduler.get(name)
+            job = await self._lookup_cron(conv, name)
             if job is None:
-                await self.signal.send(conv, f"no cron named '{name}'.")
                 return
-            await self.signal.send(conv, f"running cron '{name}' now…")
-            await self.queue.put(Job(job.conversation, job.prompt, "cron", label=name))
+            queued = await self._enqueue(
+                Job(job.conversation, job.prompt, "cron", label=name)
+            )
+            await self.signal.send(conv, f"queued cron '{name}' as #{queued.id}.")
         elif sub in ("help", "h", "?"):
             await self.signal.send(conv, commands.HELP_TEXT)
         elif sub == "add" and "|" in sub_rest:
@@ -237,10 +292,10 @@ class Daemon:
         try:
             name, schedule, prompt = commands.parse_cron_add(body)
             validate_schedule(schedule)
+            job = self.scheduler.add(name, schedule, prompt, conv)
         except ValueError as exc:
             await self.signal.send(conv, f"cron add: {exc}")
             return
-        job = self.scheduler.add(name, schedule, prompt, conv)
         await self.signal.send(
             conv,
             f"scheduled '{job.name}' ({schedule}). next run: {fmt_time(job.next_run)}",
@@ -277,17 +332,23 @@ class Daemon:
             return
         await self.signal.send_typing(conv, stop=True)
 
-        if parsed.once:
-            job = self.scheduler.add(
-                parsed.name,
-                "once",
-                parsed.prompt,
-                conv,
-                once=True,
-                next_run=parsed.at_epoch,
-            )
-        else:
-            job = self.scheduler.add(parsed.name, parsed.schedule, parsed.prompt, conv)
+        try:
+            if parsed.once:
+                job = self.scheduler.add(
+                    parsed.name,
+                    "once",
+                    parsed.prompt,
+                    conv,
+                    once=True,
+                    next_run=parsed.at_epoch,
+                )
+            else:
+                job = self.scheduler.add(
+                    parsed.name, parsed.schedule, parsed.prompt, conv
+                )
+        except ValueError as exc:
+            await self.signal.send(conv, f"couldn't schedule that: {exc}")
+            return
         await self.signal.send(
             conv,
             f"scheduled '{job.name}' — {parsed.describe()}.\n"
@@ -295,13 +356,25 @@ class Daemon:
             f"task: {parsed.prompt}",
         )
 
-    def _cron_list_text(self) -> str:
-        jobs = self.scheduler.list()
+    async def _lookup_cron(self, conv: Conversation, name: str) -> CronJob | None:
+        """Find a cron owned by ``conv``, else reply that it doesn't exist.
+
+        Managing a cron is scoped to the conversation it belongs to, so a sender
+        can't delete or trigger someone else's. A cron owned by another
+        conversation reads as absent, which keeps its existence from leaking.
+        """
+        job = self.scheduler.get_for(name, conv.key)
+        if job is None:
+            await self.signal.send(conv, f"no cron named '{name}'.")
+        return job
+
+    def _cron_list_text(self, conv: Conversation) -> str:
+        jobs = self.scheduler.list_for(conv.key)
         if not jobs:
             return "no scheduled tasks."
         lines = ["scheduled tasks:"]
         for job in jobs:
-            prompt = job.prompt if len(job.prompt) <= 60 else job.prompt[:57] + "…"
+            prompt = _truncate_prompt(job.prompt)
             lines.append(
                 f"• {job.name} [{job.schedule}] next {fmt_time(job.next_run)}\n    {prompt}"
             )
@@ -320,6 +393,108 @@ class Daemon:
             f"active crons: {len(self.scheduler.jobs)}"
         )
 
+    def _queue_text(self, conv: Conversation) -> str:
+        lines = ["queue:"]
+        visible = False
+        if (
+            self.current_job is not None
+            and self.current_job.conversation.key == conv.key
+        ):
+            visible = True
+            lines.append(f"running: {self._job_summary(self.current_job)}")
+        for job in self._pending_jobs_for(conv):
+            visible = True
+            lines.append(f"queued: {self._job_summary(job)}")
+        if not visible:
+            return "queue is empty."
+        return "\n".join(lines)
+
+    def _cancel_text(self, conv: Conversation, rest: str) -> str:
+        arg = rest.strip()
+        if not arg:
+            return self._cancel_matching(conv, None)
+        if arg.lower() == "all":
+            return self._cancel_all(conv)
+        try:
+            job_id = int(arg.removeprefix("#"))
+        except ValueError:
+            return "usage: /cancel [job-id|all]"
+        return self._cancel_matching(conv, job_id)
+
+    def _cancel_all(self, conv: Conversation) -> str:
+        removed = self._remove_pending_jobs(conv, None, all_matches=True)
+        if removed:
+            noun = "job" if removed == 1 else "jobs"
+            return f"cancelled {removed} queued {noun}."
+        return self._nothing_queued(conv)
+
+    def _cancel_matching(self, conv: Conversation, job_id: int | None) -> str:
+        removed = self._remove_pending_jobs(conv, job_id, all_matches=False)
+        if removed:
+            return f"cancelled queued job #{removed}."
+        if job_id is None:
+            return self._nothing_queued(conv)
+        if self.current_job is not None and self.current_job.id == job_id:
+            if self.current_job.conversation.key == conv.key:
+                return f"job #{job_id} is already running and can't be cancelled."
+            return f"no queued job #{job_id}."
+        return f"no queued job #{job_id}."
+
+    def _nothing_queued(self, conv: Conversation) -> str:
+        if (
+            self.current_job is not None
+            and self.current_job.conversation.key == conv.key
+        ):
+            return "nothing queued to cancel. Current job is already running."
+        return "nothing queued to cancel."
+
+    def _pending_jobs_for(self, conv: Conversation) -> list[Job]:
+        return [
+            job
+            for job in list(self.queue._queue)
+            if job is not None and job.conversation.key == conv.key
+        ]
+
+    def _remove_pending_jobs(
+        self, conv: Conversation, job_id: int | None, *, all_matches: bool
+    ) -> int:
+        kept: deque[Job | None] = deque()
+        removed = 0
+        removed_id = 0
+        for item in self.queue._queue:
+            matches = (
+                item is not None
+                and item.conversation.key == conv.key
+                and (job_id is None or item.id == job_id)
+                and (all_matches or removed == 0)
+            )
+            if matches:
+                removed += 1
+                removed_id = item.id
+                self.queue.task_done()
+            else:
+                kept.append(item)
+        self.queue._queue = kept
+        return removed if all_matches else removed_id
+
+    def _job_summary(self, job: Job) -> str:
+        kind = f"cron '{job.label}'" if job.mode == "cron" else "chat"
+        age_from = job.started_at if job.started_at is not None else job.queued_at
+        age = self._format_age(time.time() - age_from)
+        prompt = _truncate_prompt(job.prompt)
+        return f"#{job.id} {kind}, {age} ago — {prompt}"
+
+    @staticmethod
+    def _format_age(seconds: float) -> str:
+        seconds = max(0, int(seconds))
+        if seconds < 60:
+            return f"{seconds}s"
+        minutes, seconds = divmod(seconds, 60)
+        if minutes < 60:
+            return f"{minutes}m{seconds:02d}s"
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours}h{minutes:02d}m"
+
     # --- job worker ----------------------------------------------------
     async def _run_jobs(self) -> None:
         while True:
@@ -327,11 +502,14 @@ class Daemon:
             if job is None:  # shutdown sentinel
                 self.queue.task_done()
                 return
+            job.started_at = time.time()
+            self.current_job = job
             try:
                 await self._run_one_job(job)
             except Exception:
                 log.exception("job failed")
             finally:
+                self.current_job = None
                 self.queue.task_done()
 
     async def _run_one_job(self, job: Job) -> None:
@@ -365,7 +543,7 @@ class Daemon:
             # alongside every add/remove/list, so they never race.
             for job in self.scheduler.due(time.time()):
                 log.info("cron '%s' is due", job.name)
-                await self.queue.put(
+                await self._enqueue(
                     Job(
                         job.conversation,
                         job.prompt,
@@ -381,7 +559,8 @@ class Daemon:
     async def _safe_send(self, conv: Conversation, text: str) -> bool:
         """Send a reply, returning whether it was delivered."""
         try:
-            await self.signal.send(conv, text)
+            for chunk in split_reply(text):
+                await self.signal.send(conv, chunk)
             return True
         except Exception as exc:
             log.error("failed to send reply to %s: %s", conv.key, exc)

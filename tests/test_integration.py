@@ -13,7 +13,7 @@ import httpx
 import pytest
 
 from nbclaw.config import Config
-from nbclaw.daemon import Daemon, Job
+from nbclaw.daemon import MAX_REPLY_CHARS, Daemon, Job, split_reply
 from nbclaw.signal_client import Conversation, IncomingMessage
 
 
@@ -110,6 +110,48 @@ def test_cron_lifecycle(tmp_path):
     assert "nightly" not in d.scheduler.jobs
 
 
+def test_cron_management_is_scoped_to_conversation(tmp_path):
+    d = make_daemon(tmp_path)
+    owner = "+15550000001"
+    other = "+15550000002"
+
+    asyncio.run(d._dispatch(incoming("/cron add mine @daily | say hi", source=owner)))
+    assert "mine" in d.scheduler.jobs
+
+    # A different conversation can't see, delete, or run someone else's cron.
+    asyncio.run(d._dispatch(incoming("/cron list", source=other)))
+    assert "mine" not in d.signal.last
+    assert "no scheduled tasks" in d.signal.last
+
+    asyncio.run(d._dispatch(incoming("/cron del mine", source=other)))
+    assert "no cron named 'mine'" in d.signal.last
+    assert "mine" in d.scheduler.jobs  # untouched
+
+    asyncio.run(d._dispatch(incoming("/cron run mine", source=other)))
+    assert "no cron named 'mine'" in d.signal.last
+    assert d.queue.qsize() == 0  # nothing was enqueued to fire
+
+    # The owning conversation still sees and controls its own cron.
+    asyncio.run(d._dispatch(incoming("/cron list", source=owner)))
+    assert "mine" in d.signal.last
+    asyncio.run(d._dispatch(incoming("/cron del mine", source=owner)))
+    assert "cancelled" in d.signal.last
+    assert "mine" not in d.scheduler.jobs
+
+
+def test_cron_add_rejected_when_conversation_full(tmp_path):
+    from nbclaw.scheduler import MAX_CRONS_PER_CONVERSATION
+
+    d = make_daemon(tmp_path)
+    conv = Conversation(recipient="+15550000001")
+    for i in range(MAX_CRONS_PER_CONVERSATION):
+        d.scheduler.add(f"job{i}", "@daily", "p", conv)
+
+    asyncio.run(d._dispatch(incoming("/cron add toomany @daily | nope")))
+    assert "too many scheduled tasks" in d.signal.last
+    assert "toomany" not in d.scheduler.jobs
+
+
 def test_cron_add_bad_schedule(tmp_path):
     d = make_daemon(tmp_path)
     asyncio.run(d._dispatch(incoming("/cron add x bogus-schedule | do it")))
@@ -128,8 +170,62 @@ def test_chat_message_is_queued(tmp_path):
     asyncio.run(d._dispatch(incoming("what is 2+2?")))
     assert d.queue.qsize() == 1
     job = d.queue.get_nowait()
+    assert job.id == 1
     assert job.mode == "chat"
     assert job.prompt == "what is 2+2?"
+
+
+async def _queue_two_chats(d: Daemon) -> None:
+    await d._dispatch(incoming("first"))
+    await d._dispatch(incoming("second"))
+
+
+def test_queue_command_lists_this_conversation_only(tmp_path):
+    d = make_daemon(tmp_path)
+    other = Conversation(recipient="+15550000002")
+    asyncio.run(d._enqueue(Job(other, "secret other chat", "chat")))
+    asyncio.run(_queue_two_chats(d))
+
+    asyncio.run(d._dispatch(incoming("/queue")))
+
+    assert "#2 chat" in d.signal.last
+    assert "#3 chat" in d.signal.last
+    assert "secret other chat" not in d.signal.last
+
+
+def test_cancel_without_id_cancels_this_conversation_only(tmp_path):
+    d = make_daemon(tmp_path)
+    other = Conversation(recipient="+15550000002")
+    asyncio.run(d._enqueue(Job(other, "keep", "chat")))
+    asyncio.run(_queue_two_chats(d))
+
+    asyncio.run(d._dispatch(incoming("/cancel")))
+
+    assert d.signal.last == "cancelled queued job #2."
+    remaining = list(d.queue._queue)
+    assert [(job.id, job.prompt) for job in remaining] == [(1, "keep"), (3, "second")]
+
+
+def test_cancel_all_cancels_only_this_conversation(tmp_path):
+    d = make_daemon(tmp_path)
+    other = Conversation(recipient="+15550000002")
+    asyncio.run(d._enqueue(Job(other, "keep", "chat")))
+    asyncio.run(_queue_two_chats(d))
+
+    asyncio.run(d._dispatch(incoming("/cancel all")))
+
+    assert d.signal.last == "cancelled 2 queued jobs."
+    remaining = list(d.queue._queue)
+    assert [(job.id, job.prompt) for job in remaining] == [(1, "keep")]
+
+
+def test_cancel_running_job_reports_not_cancellable(tmp_path):
+    d = make_daemon(tmp_path)
+    d.current_job = Job(Conversation(recipient="+15550000001"), "busy", "chat", id=7)
+
+    asyncio.run(d._dispatch(incoming("/cancel 7")))
+
+    assert "already running" in d.signal.last
 
 
 def test_received_message_gets_reaction_before_dispatch(tmp_path):
@@ -147,14 +243,45 @@ def test_received_message_gets_reaction_before_dispatch(tmp_path):
 
 
 class FakeAgent:
+    def __init__(self, answer="done"):
+        self.answer = answer
+
     async def once(self, prompt):
-        return "done"
+        return self.answer
 
     async def chat(self, key, prompt):
-        return "done"
+        return self.answer
 
     def close_all(self):
         pass
+
+
+async def _safe_send_long_answer(d: Daemon, text: str) -> None:
+    await d._safe_send(Conversation(recipient="+15550000001"), text)
+
+
+def test_split_reply_numbers_chunks_under_limit():
+    text = "alpha " * MAX_REPLY_CHARS
+
+    chunks = split_reply(text)
+
+    assert len(chunks) > 1
+    assert all(len(chunk) <= MAX_REPLY_CHARS for chunk in chunks)
+    assert chunks[0].startswith("(1/")
+    assert chunks[-1].startswith(f"({len(chunks)}/{len(chunks)})")
+
+
+def test_safe_send_splits_long_replies(tmp_path):
+    d = make_daemon(tmp_path)
+    text = "x" * (MAX_REPLY_CHARS + 100)
+
+    asyncio.run(_safe_send_long_answer(d, text))
+
+    messages = [message for _, message in d.signal.sent]
+    assert len(messages) == 2
+    assert messages[0].startswith("(1/2) ")
+    assert messages[1].startswith("(2/2) ")
+    assert all(len(message) <= MAX_REPLY_CHARS for message in messages)
 
 
 def test_scheduled_cron_finalized_after_delivery(tmp_path):

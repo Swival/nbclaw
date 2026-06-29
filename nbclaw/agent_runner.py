@@ -20,6 +20,11 @@ from swival import AgentError, Result, Session
 
 log = logging.getLogger("nbclaw.agent")
 
+# Cap on retained chat sessions, keyed by untrusted Signal sender (group id or
+# 1:1 number). Past the cap the least-recently-used session is evicted so memory
+# and per-session MCP processes can't grow without bound.
+MAX_CHAT_SESSIONS = 32
+
 
 def _setup_and_report_mcp(session: Session) -> None:
     """Force swival's lazy setup and log how many MCP tools loaded.
@@ -50,16 +55,24 @@ class AgentRunner:
         self._sessions: dict[str, Session] = {}
 
     def _session_for(self, key: str) -> Session:
-        session = self._sessions.get(key)
-        if session is None:
-            log.info("creating session for %s", key)
-            session = Session(**self._kwargs)
-            # swival starts MCP servers lazily inside the first run/ask. Trigger
-            # it now so any spawn failure surfaces here, and log the tool count
-            # as visible confirmation the servers actually came up.
-            if self._kwargs.get("mcp_servers"):
-                _setup_and_report_mcp(session)
+        session = self._sessions.pop(key, None)
+        if session is not None:
+            # Move to the end as most-recently-used; eviction drops the front.
             self._sessions[key] = session
+            return session
+        if len(self._sessions) >= MAX_CHAT_SESSIONS:
+            old_key, old_session = next(iter(self._sessions.items()))
+            del self._sessions[old_key]
+            log.info("evicting least-recently-used session for %s", old_key)
+            _safe_close(old_session)
+        log.info("creating session for %s", key)
+        session = Session(**self._kwargs)
+        # swival starts MCP servers lazily inside the first run/ask. Trigger
+        # it now so any spawn failure surfaces here, and log the tool count
+        # as visible confirmation the servers actually came up.
+        if self._kwargs.get("mcp_servers"):
+            _setup_and_report_mcp(session)
+        self._sessions[key] = session
         return session
 
     def reset(self, key: str) -> bool:

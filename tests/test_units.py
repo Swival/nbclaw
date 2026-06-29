@@ -7,10 +7,12 @@ import time
 
 import pytest
 
+from nbclaw.agent_runner import MAX_CHAT_SESSIONS, AgentRunner
 from nbclaw.commands import CronAddError, parse_cron_add
 from nbclaw.config import Config
 from nbclaw.nl_schedule import ParseError, _build, _extract_json
 from nbclaw.scheduler import (
+    MAX_CRONS_PER_CONVERSATION,
     Scheduler,
     next_fire,
     parse_duration,
@@ -111,6 +113,30 @@ def test_scheduler_due(tmp_path):
     assert sched.jobs["soon"].next_run > now
     assert sched.jobs["soon"].last_run == now
     assert sched.due(now) == []
+
+
+def test_scheduler_list_for_is_per_conversation(tmp_path):
+    sched = Scheduler(tmp_path / "c.json")
+    alice = Conversation(recipient="+1")
+    bob = Conversation(group_id="grp==")
+    sched.add("a1", "@daily", "p", alice)
+    sched.add("a2", "@daily", "p", alice)
+    sched.add("b1", "@daily", "p", bob)
+    assert {j.name for j in sched.list_for(alice.key)} == {"a1", "a2"}
+    assert {j.name for j in sched.list_for(bob.key)} == {"b1"}
+
+
+def test_scheduler_caps_crons_per_conversation(tmp_path):
+    sched = Scheduler(tmp_path / "c.json")
+    conv = Conversation(recipient="+1")
+    for i in range(MAX_CRONS_PER_CONVERSATION):
+        sched.add(f"job{i}", "@daily", "p", conv)
+    with pytest.raises(ValueError, match="too many scheduled tasks"):
+        sched.add("overflow", "@daily", "p", conv)
+    assert "overflow" not in sched.jobs
+    # The cap is per conversation: a different one can still schedule.
+    other = sched.add("fresh", "@daily", "p", Conversation(recipient="+2"))
+    assert other.name == "fresh"
 
 
 def test_scheduler_remove(tmp_path):
@@ -406,6 +432,24 @@ def test_parse_sse_stream():
     assert events[0]["params"]["envelope"]["dataMessage"]["message"] == "hi"
 
 
+def test_parse_sse_rejects_unterminated_event():
+    # A backend that streams data: lines and never sends the blank separator
+    # must not accumulate without bound — the parser bails so events() reconnects.
+    chunk = "A" * 100_000
+
+    class FloodResp:
+        async def aiter_lines(self):
+            while True:
+                yield "data: " + chunk
+
+    async def drain():
+        async for _ in _parse_sse(FloodResp()):
+            pass
+
+    with pytest.raises(ValueError, match="too large"):
+        asyncio.run(drain())
+
+
 # --- config -----------------------------------------------------------
 def test_session_kwargs_safe_vs_autonomous():
     safe = Config(safe=True, model="m").session_kwargs()
@@ -529,3 +573,38 @@ def test_session_kwargs_swival_override():
     kw = cfg.session_kwargs()
     assert kw["max_turns"] == 7
     assert kw["temperature"] == 0.1
+
+
+# --- agent session bounding ------------------------------------------
+class _FakeSession:
+    def __init__(self, **kwargs):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+def test_agent_runner_bounds_session_count(monkeypatch):
+    monkeypatch.setattr("nbclaw.agent_runner.Session", _FakeSession)
+    runner = AgentRunner({})
+    overflow = 8
+    created = [
+        runner._session_for(f"user:+{i}") for i in range(MAX_CHAT_SESSIONS + overflow)
+    ]
+    assert len(runner._sessions) == MAX_CHAT_SESSIONS
+    # The earliest keys were evicted, and exactly those sessions were closed.
+    assert sum(1 for s in created if s.closed) == overflow
+    assert "user:+0" not in runner._sessions
+    assert f"user:+{MAX_CHAT_SESSIONS + overflow - 1}" in runner._sessions
+
+
+def test_agent_runner_evicts_least_recently_used(monkeypatch):
+    monkeypatch.setattr("nbclaw.agent_runner.Session", _FakeSession)
+    runner = AgentRunner({})
+    for i in range(MAX_CHAT_SESSIONS):
+        runner._session_for(f"k{i}")
+    runner._session_for("k0")  # touch the oldest so it's most-recently-used
+    runner._session_for("fresh")  # forces one eviction
+    assert "k0" in runner._sessions  # spared: just used
+    assert "k1" not in runner._sessions  # evicted as the new oldest
+    assert "fresh" in runner._sessions

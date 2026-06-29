@@ -26,6 +26,11 @@ from .signal_client import Conversation
 
 log = logging.getLogger("nbclaw.cron")
 
+# Most crons one conversation may keep at once. They come from untrusted Signal
+# senders and persist on disk, so this caps what a sender can pile up — both the
+# storage and the agent runs each cron triggers when it fires.
+MAX_CRONS_PER_CONVERSATION = 50
+
 _NAMED = {
     "@hourly": "0 * * * *",
     "@daily": "0 0 * * *",
@@ -149,6 +154,11 @@ class Scheduler:
     ) -> CronJob:
         """Schedule a job. ``next_run`` overrides the schedule (one-shot times)."""
         now = time.time() if now is None else now
+        if self._count_for(conv.key) >= MAX_CRONS_PER_CONVERSATION:
+            raise ValueError(
+                f"too many scheduled tasks for this conversation "
+                f"(limit {MAX_CRONS_PER_CONVERSATION}); remove some with /cron del"
+            )
         if next_run is None:
             validate_schedule(schedule)
             next_run = next_fire(schedule, now)
@@ -185,8 +195,24 @@ class Scheduler:
     def get(self, name: str) -> CronJob | None:
         return self.jobs.get(name)
 
+    def get_for(self, name: str, key: str) -> CronJob | None:
+        """Like :meth:`get`, but only if the cron belongs to conversation ``key``."""
+        job = self.jobs.get(name)
+        return job if job is not None and job.conversation.key == key else None
+
     def list(self) -> list[CronJob]:
         return sorted(self.jobs.values(), key=lambda j: j.next_run)
+
+    def list_for(self, key: str) -> list[CronJob]:
+        """Crons owned by one conversation, soonest first."""
+        return sorted(self._for(key), key=lambda j: j.next_run)
+
+    def _for(self, key: str):
+        """Jobs owned by the conversation with this ``Conversation.key``."""
+        return (j for j in self.jobs.values() if j.conversation.key == key)
+
+    def _count_for(self, key: str) -> int:
+        return sum(1 for _ in self._for(key))
 
     # --- ticking -------------------------------------------------------
     def due(self, now: float | None = None) -> list[CronJob]:
