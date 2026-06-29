@@ -291,6 +291,45 @@ def test_send_reaction_direct(monkeypatch):
     ]
 
 
+def test_send_reaction_remove(monkeypatch):
+    env = {
+        "params": {
+            "envelope": {
+                "sourceNumber": "+33600000000",
+                "sourceUuid": "uuid-1",
+                "timestamp": 123,
+                "dataMessage": {"message": "hello there"},
+            }
+        }
+    }
+    msg = _to_message(env)
+    client = SignalClient("http://signal.local")
+    calls = []
+
+    async def fake_rpc(method, params=None):
+        calls.append((method, params))
+        return {}
+
+    monkeypatch.setattr(client, "_rpc", fake_rpc)
+    try:
+        asyncio.run(client.send_reaction(msg, "👀", remove=True))
+    finally:
+        asyncio.run(client.aclose())
+
+    assert calls == [
+        (
+            "sendReaction",
+            {
+                "emoji": "👀",
+                "targetAuthor": "+33600000000",
+                "targetTimestamp": 123,
+                "recipient": ["+33600000000"],
+                "remove": True,
+            },
+        )
+    ]
+
+
 def test_to_message_group():
     env = {
         "params": {

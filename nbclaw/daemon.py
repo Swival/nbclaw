@@ -92,6 +92,9 @@ class Job:
     id: int = 0
     queued_at: float = field(default_factory=time.time)
     started_at: float | None = None
+    # The message that triggered this job, when it came from a chat (not a cron).
+    # Carried so the worker can clear its "read" reaction once the reply lands.
+    origin: IncomingMessage | None = None
 
 
 class Daemon:
@@ -221,17 +224,29 @@ class Daemon:
             log.info("[%s] %s", msg.conversation.key, msg.text)
             await self.signal.send_reaction(msg)
             try:
-                await self._dispatch(msg)
+                handled = await self._dispatch(msg)
             except Exception as exc:
                 log.exception("dispatch failed")
                 await self._safe_send(msg.conversation, f"error: {exc}")
+                handled = True
+            # Commands are answered inline, so the message is fully dealt with
+            # here; clear the reaction now. Chat jobs are still queued, so the
+            # worker clears theirs once the reply is actually delivered.
+            if handled:
+                await self.signal.send_reaction(msg, remove=True)
 
-    async def _dispatch(self, msg: IncomingMessage) -> None:
+    async def _dispatch(self, msg: IncomingMessage) -> bool:
+        """Handle a message, returning whether it was answered inline.
+
+        ``True`` means a command was fully handled here; ``False`` means the
+        message was queued as a chat job for the worker to answer later.
+        """
         text = msg.text
         if not text.startswith("/"):
-            await self._enqueue(Job(msg.conversation, text, "chat"))
-            return
+            await self._enqueue(Job(msg.conversation, text, "chat", origin=msg))
+            return False
         await self._handle_command(msg.conversation, text)
+        return True
 
     # --- command handling ----------------------------------------------
     async def _handle_command(self, conv: Conversation, text: str) -> None:
@@ -528,6 +543,8 @@ class Daemon:
         finally:
             await self.signal.send_typing(conv, stop=True)
         delivered = await self._safe_send(conv, answer)
+        if job.origin is not None:
+            await self.signal.send_reaction(job.origin, remove=True)
         # Advance/remove the schedule only once the firing was actually
         # delivered, so a crash or a failed send re-fires this cron later.
         if job.finalize:

@@ -20,7 +20,8 @@ from nbclaw.signal_client import Conversation, IncomingMessage
 class FakeSignal:
     def __init__(self):
         self.sent: list[tuple[str, str]] = []  # (conv.key, message)
-        self.reactions: list[tuple[str, int, str]] = []  # (author, timestamp, emoji)
+        # (author, timestamp, emoji, removed)
+        self.reactions: list[tuple[str, int, str, bool]] = []
 
     async def version(self):
         return "fake"
@@ -28,8 +29,9 @@ class FakeSignal:
     async def send(self, conv, message):
         self.sent.append((conv.key, message))
 
-    async def send_reaction(self, msg, emoji="👀"):
-        self.reactions.append((msg.source or msg.source_uuid, msg.timestamp, emoji))
+    async def send_reaction(self, msg, emoji="👀", *, remove=False):
+        author = msg.source or msg.source_uuid
+        self.reactions.append((author, msg.timestamp, emoji, remove))
 
     async def send_typing(self, conv, *, stop=False):
         pass
@@ -238,8 +240,52 @@ def test_received_message_gets_reaction_before_dispatch(tmp_path):
 
     asyncio.run(d._consume_events())
 
-    assert d.signal.reactions == [("+15550000001", 1, "👀")]
+    # The chat message is reacted to and queued; its reaction is cleared later
+    # by the worker, not here, so only the eye reaction is recorded so far.
+    assert d.signal.reactions == [("+15550000001", 1, "👀", False)]
     assert d.queue.qsize() == 1
+    queued = d.queue.get_nowait()
+    assert queued.origin is not None  # carried so the worker can clear it
+
+
+def test_command_clears_reaction_after_answering(tmp_path):
+    class OneCommandSignal(FakeSignal):
+        async def events(self):
+            yield incoming("/help")
+
+    d = make_daemon(tmp_path)
+    d.signal = OneCommandSignal()
+
+    asyncio.run(d._consume_events())
+
+    # Commands answer inline, so the eye reaction is added then cleared.
+    assert d.signal.reactions == [
+        ("+15550000001", 1, "👀", False),
+        ("+15550000001", 1, "👀", True),
+    ]
+
+
+def test_chat_job_clears_reaction_after_reply(tmp_path):
+    d = make_daemon(tmp_path)
+    d.agent = FakeAgent()
+    msg = incoming("what is 2+2?")
+    job = Job(msg.conversation, msg.text, "chat", origin=msg)
+
+    asyncio.run(d._run_one_job(job))
+
+    assert d.signal.sent
+    assert d.signal.reactions == [("+15550000001", 1, "👀", True)]
+
+
+def test_cron_job_leaves_no_reaction(tmp_path):
+    d = make_daemon(tmp_path)
+    d.agent = FakeAgent()
+    conv = Conversation(recipient="+15550000001")
+    job = Job(conv, "tick", "cron", label="r")
+
+    asyncio.run(d._run_one_job(job))
+
+    assert d.signal.reactions == []
 
 
 class FakeAgent:

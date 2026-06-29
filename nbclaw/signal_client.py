@@ -91,8 +91,14 @@ class SignalClient:
     async def send(self, conv: Conversation, message: str) -> None:
         await self._rpc("send", conv.send_params(message))
 
-    async def send_reaction(self, msg: IncomingMessage, emoji: str = "👀") -> None:
-        """React to an incoming message. Best-effort, like typing indicators."""
+    async def send_reaction(
+        self, msg: IncomingMessage, emoji: str = "👀", *, remove: bool = False
+    ) -> None:
+        """React to an incoming message, or clear that reaction with ``remove``.
+
+        Best-effort, like typing indicators. Removal must use the same emoji the
+        reaction was sent with, so both default to the same eye.
+        """
         target_author = msg.source or msg.source_uuid
         if not target_author or not msg.timestamp:
             log.debug("cannot react: missing target author or timestamp")
@@ -103,6 +109,8 @@ class SignalClient:
             "targetTimestamp": msg.timestamp,
             **msg.conversation.routing_params(),
         }
+        if remove:
+            params["remove"] = True
         try:
             await self._rpc("sendReaction", params)
         except Exception as exc:  # reactions are best-effort
