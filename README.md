@@ -22,7 +22,7 @@ uv sync
 
 uv run nbclaw \
     --allow YOURPHONE \
-    --model ornith-1.0-9b \
+    --model gemma-4-12b-it-qat@q4_k_xl \
     --notify YOURPHONE
 ```
 
@@ -112,7 +112,7 @@ allow = ["YOURPHONE"]
 notify = "YOURPHONE"
 
 provider = "lmstudio"
-model = "ornith-1.0-9b"
+model = "gemma-4-12b-it-qat@q4_k_xl"
 # base_url = "http://127.0.0.1:1234"   # only if not the provider default
 max_turns = 60
 
