@@ -46,7 +46,7 @@ class FakeSignal:
 
 def make_daemon(tmp_path, **overrides) -> Daemon:
     cfg = Config(
-        model="gemma-4-12b-it-qat@q4_k_xl",
+        model="ornith-1.0-9b",
         state_dir=tmp_path,
         allow=["+15550000001"],
         **overrides,
@@ -75,7 +75,7 @@ def test_help_command(tmp_path):
 def test_status_command(tmp_path):
     d = make_daemon(tmp_path)
     asyncio.run(d._dispatch(incoming("/status")))
-    assert "model: gemma-4-12b-it-qat@q4_k_xl" in d.signal.last
+    assert "model: ornith-1.0-9b" in d.signal.last
 
 
 def test_clear_reset_and_new_aliases(tmp_path):

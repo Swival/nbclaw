@@ -215,7 +215,7 @@ def build_config(argv: list[str] | None = None) -> Config:
     )
     parser.add_argument("--notify", help="Number to message when the daemon starts.")
     parser.add_argument("--provider", help="swival provider (lmstudio, generic, ...).")
-    parser.add_argument("--model", help="Model id (e.g. gemma-4-12b-it-qat@q4_k_xl).")
+    parser.add_argument("--model", help="Model id (e.g. ornith-1.0-9b).")
     parser.add_argument("--base-url", help="Override the provider endpoint URL.")
     parser.add_argument("--api-key", help="API key for the provider, if needed.")
     parser.add_argument(
