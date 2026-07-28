@@ -40,6 +40,7 @@ def _setup_and_report_mcp(session: Session) -> None:
         log.info("MCP servers ready: %d tool(s) available", count)
     except Exception as exc:
         log.error("MCP server startup failed: %s", exc)
+        raise
 
 
 def _safe_close(session: Session) -> None:
@@ -60,18 +61,25 @@ class AgentRunner:
             # Move to the end as most-recently-used; eviction drops the front.
             self._sessions[key] = session
             return session
+        log.info("creating session for %s", key)
+        session = Session(**self._kwargs)
+        try:
+            # swival starts MCP servers lazily inside the first run/ask. Trigger
+            # it now so any spawn failure surfaces here, and log the tool count
+            # as visible confirmation the servers actually came up.
+            if self._kwargs.get("mcp_servers"):
+                _setup_and_report_mcp(session)
+        except Exception:
+            # A failed setup may already own MCP processes or an event loop. Do
+            # not cache that partial session: a later retry would overwrite its
+            # managers and make those resources unreachable.
+            _safe_close(session)
+            raise
         if len(self._sessions) >= MAX_CHAT_SESSIONS:
             old_key, old_session = next(iter(self._sessions.items()))
             del self._sessions[old_key]
             log.info("evicting least-recently-used session for %s", old_key)
             _safe_close(old_session)
-        log.info("creating session for %s", key)
-        session = Session(**self._kwargs)
-        # swival starts MCP servers lazily inside the first run/ask. Trigger
-        # it now so any spawn failure surfaces here, and log the tool count
-        # as visible confirmation the servers actually came up.
-        if self._kwargs.get("mcp_servers"):
-            _setup_and_report_mcp(session)
         self._sessions[key] = session
         return session
 

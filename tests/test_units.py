@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 
 import pytest
@@ -20,6 +21,8 @@ from nbclaw.scheduler import (
     validate_schedule,
 )
 from nbclaw.signal_client import Conversation, SignalClient, _parse_sse, _to_message
+from swival import Result
+from swival.mcp_client import McpManager
 
 
 # --- duration / schedule parsing -------------------------------------
@@ -647,3 +650,51 @@ def test_agent_runner_evicts_least_recently_used(monkeypatch):
     assert "k0" in runner._sessions  # spared: just used
     assert "k1" not in runner._sessions  # evicted as the new oldest
     assert "fresh" in runner._sessions
+
+
+def test_agent_runner_closes_and_discards_failed_mcp_setup(monkeypatch):
+    created = []
+
+    class FailingSession(_FakeSession):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            created.append(self)
+
+        def _setup(self):
+            raise RuntimeError("setup failed")
+
+    monkeypatch.setattr("nbclaw.agent_runner.Session", FailingSession)
+    runner = AgentRunner({"mcp_servers": {"test": {}}})
+
+    with pytest.raises(RuntimeError, match="setup failed"):
+        runner._session_for("user:+1")
+
+    assert created[0].closed is True
+    assert runner._sessions == {}
+
+
+def test_cron_sessions_do_not_leak_swival_event_loop_fds(monkeypatch):
+    class McpSession:
+        def __init__(self, **kwargs):
+            self.manager = McpManager({})
+            self.manager.start()
+
+        def run(self, prompt):
+            return Result(answer="done", exhausted=False, messages=[], report=None)
+
+        def close(self):
+            self.manager.close()
+
+    monkeypatch.setattr("nbclaw.agent_runner.Session", McpSession)
+    runner = AgentRunner({})
+
+    # Warm up one-time imports/threading state before measuring repeated cron
+    # one-shots, each of which owns a fresh Swival MCP event loop.
+    for _ in range(3):
+        runner._once_blocking("tick")
+    before = len(os.listdir("/dev/fd"))
+    for _ in range(10):
+        runner._once_blocking("tick")
+    after = len(os.listdir("/dev/fd"))
+
+    assert after - before <= 2, f"leaked {after - before} fds over 10 cron sessions"

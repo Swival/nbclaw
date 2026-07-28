@@ -5,7 +5,7 @@ description = "No Bullshit Claw — a 24/7 Signal-driven Swival agent daemon"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "swival",
+    "swival>=1.0.39",
     "httpx>=0.28.1",
     "croniter>=3.0.0",
 ]
