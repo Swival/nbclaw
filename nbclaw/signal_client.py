@@ -41,13 +41,24 @@ class Conversation:
     def key(self) -> str:
         return f"group:{self.group_id}" if self.group_id else f"user:{self.recipient}"
 
+    @property
+    def deliverable(self) -> bool:
+        """Whether a reply can be addressed anywhere at all.
+
+        The one place this rule lives: the scheduler won't store a task it could
+        never deliver, and the event stream drops a message it can't answer.
+        """
+        return bool(self.recipient or self.group_id)
+
     def routing_params(self) -> dict:
         """The signal-cli params that address this conversation."""
-        if self.group_id:
-            return {"groupId": self.group_id}
-        if self.recipient is None:
+        if not self.deliverable:
             raise ValueError("conversation has neither a recipient nor a group_id")
-        return {"recipient": [self.recipient]}
+        return (
+            {"groupId": self.group_id}
+            if self.group_id
+            else {"recipient": [self.recipient]}
+        )
 
     def send_params(self, message: str) -> dict:
         return {"message": message, **self.routing_params()}
@@ -179,7 +190,31 @@ async def _parse_sse(resp: httpx.Response):
         # other SSE fields (event:, id:) are ignored
 
 
-def _to_message(envelope: dict) -> IncomingMessage | None:
+def _mapping(value: object, what: str) -> dict:
+    """``value`` as a dict; anything else is treated as absent, and logged.
+
+    signal-cli is a separate process, so its JSON can be any shape. Descending
+    blindly raises out of the SSE generator, costing us the whole stream over one
+    bad event.
+    """
+    if isinstance(value, dict):
+        return value
+    if value is not None:
+        log.debug("ignoring malformed %s in event: %r", what, value)
+    return {}
+
+
+def _message_text(payload: dict) -> str:
+    """The stripped body of a data/sent message, or "" if there is none.
+
+    Whitespace-only counts as none: not a command, and an empty prompt for the
+    agent.
+    """
+    message = payload.get("message")
+    return message.strip() if isinstance(message, str) else ""
+
+
+def _to_message(envelope: object) -> IncomingMessage | None:
     """Extract a usable text message, or None for anything we don't act on.
 
     Two channels carry a command, depending on how the bot's number is set up:
@@ -194,26 +229,28 @@ def _to_message(envelope: dict) -> IncomingMessage | None:
     """
     # The SSE payload may be a bare {"envelope": ...} or a JSON-RPC
     # {"method":"receive","params":{"envelope": ...}} notification.
-    params = envelope.get("params", envelope)
-    env = params.get("envelope", params)
+    event = _mapping(envelope, "event")
+    params = _mapping(event.get("params", event), "params")
+    env = _mapping(params.get("envelope", params), "envelope")
 
-    data_message = env.get("dataMessage")
-    if data_message and data_message.get("message"):
-        group_id = (data_message.get("groupInfo") or {}).get("groupId")
+    data_message = _mapping(env.get("dataMessage"), "dataMessage")
+    text = _message_text(data_message)
+    if text:
+        group_id = _mapping(data_message.get("groupInfo"), "groupInfo").get("groupId")
         source = env.get("sourceNumber") or env.get("source")
         conv = (
             Conversation(group_id=group_id)
             if group_id
             else Conversation(recipient=source)
         )
-        return _build(env, data_message["message"], conv, env.get("timestamp", 0))
+        return _build(env, text, conv, env.get("timestamp", 0))
 
-    sent = (env.get("syncMessage") or {}).get("sentMessage")
-    if sent and sent.get("message") and _is_note_to_self(env, sent):
+    sync = _mapping(env.get("syncMessage"), "syncMessage")
+    sent = _mapping(sync.get("sentMessage"), "sentMessage")
+    text = _message_text(sent)
+    if text and _is_note_to_self(env, sent):
         dest = sent.get("destinationNumber") or sent.get("destination")
-        return _build(
-            env, sent["message"], Conversation(recipient=dest), sent.get("timestamp", 0)
-        )
+        return _build(env, text, Conversation(recipient=dest), sent.get("timestamp", 0))
 
     return None  # receipt, typing, reaction, sync-to-someone-else, etc.
 
@@ -229,10 +266,20 @@ def _is_note_to_self(env: dict, sent: dict) -> bool:
     return bool((dst_uuid and dst_uuid == src_uuid) or (dst_num and dst_num == src_num))
 
 
-def _build(env: dict, text: str, conv: Conversation, timestamp: int) -> IncomingMessage:
+def _build(
+    env: dict, text: str, conv: Conversation, timestamp: int
+) -> IncomingMessage | None:
+    """Assemble a message, or None if there's nowhere to answer it.
+
+    ``text`` arrives already stripped. Dropping an unaddressable envelope here
+    keeps it from raising later, out of a reply that nothing guards.
+    """
+    if not conv.deliverable:
+        log.debug("ignoring message with no reply destination: %r", env)
+        return None
     return IncomingMessage(
         conversation=conv,
-        text=text.strip(),
+        text=text,
         source=env.get("sourceNumber") or env.get("source"),
         source_uuid=env.get("sourceUuid"),
         timestamp=timestamp,

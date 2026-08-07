@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import threading
 import time
+from dataclasses import fields
+from pathlib import Path
 
 import pytest
 
 from nbclaw.agent_runner import MAX_CHAT_SESSIONS, AgentRunner
 from nbclaw.commands import CronAddError, parse_cron_add
-from nbclaw.config import Config
+from nbclaw.config import _TOML_SCHEMA, Config, build_config
 from nbclaw.nl_schedule import ParseError, _build, _extract_json
 from nbclaw.scheduler import (
     MAX_CRONS_PER_CONVERSATION,
@@ -140,6 +144,60 @@ def test_scheduler_caps_crons_per_conversation(tmp_path):
     # The cap is per conversation: a different one can still schedule.
     other = sched.add("fresh", "@daily", "p", Conversation(recipient="+2"))
     assert other.name == "fresh"
+
+
+def test_scheduler_rejects_conversation_with_no_destination(tmp_path):
+    sched = Scheduler(tmp_path / "c.json")
+    with pytest.raises(ValueError, match="nowhere to deliver"):
+        sched.add("nodest", "@daily", "p", Conversation())
+    assert sched.jobs == {}
+
+
+def test_scheduler_skips_persisted_crons_with_no_destination(tmp_path):
+    # Nothing could ever deliver it, so it must not be loaded at all.
+    path = tmp_path / "c.json"
+    path.write_text(
+        json.dumps(
+            {
+                "jobs": [
+                    {
+                        "name": "orphan",
+                        "schedule": "@daily",
+                        "prompt": "p",
+                        "recipient": None,
+                        "group_id": None,
+                        "next_run": 0.0,
+                        "created": 0.0,
+                    },
+                    {
+                        "name": "fine",
+                        "schedule": "@daily",
+                        "prompt": "p",
+                        "recipient": "+1",
+                        "group_id": None,
+                        "next_run": 0.0,
+                        "created": 0.0,
+                    },
+                    ["not", "an", "object"],
+                ]
+            }
+        )
+    )
+    sched = Scheduler(path)
+    assert set(sched.jobs) == {"fine"}
+
+
+def test_scheduler_validates_recurring_schedule_with_explicit_next_run(tmp_path):
+    # A recurring job is rejected now, not when complete() can't advance it.
+    sched = Scheduler(tmp_path / "c.json")
+    conv = Conversation(recipient="+1")
+    with pytest.raises(ValueError):
+        sched.add("bad", "not-a-schedule", "p", conv, next_run=4_000_000_000.0)
+    assert sched.jobs == {}
+    # A one-shot still gets to carry its placeholder schedule.
+    job = sched.add("ok", "once", "p", conv, once=True, next_run=4_000_000_000.0)
+    assert job.schedule == "once"
+    assert job.next_run == 4_000_000_000.0
 
 
 def test_scheduler_remove(tmp_path):
@@ -396,6 +454,58 @@ def test_to_message_ignores_receipts():
     )
 
 
+def test_to_message_ignores_blank_messages():
+    # Not a command, and an empty prompt for the agent: ignored on both channels.
+    env = {"sourceNumber": "+1", "timestamp": 1, "dataMessage": {"message": "   \t "}}
+    assert _to_message({"params": {"envelope": env}}) is None
+    sync = {
+        "sourceNumber": "+1",
+        "syncMessage": {"sentMessage": {"message": " ", "destinationNumber": "+1"}},
+    }
+    assert _to_message({"params": {"envelope": sync}}) is None
+
+
+def test_to_message_ignores_messages_with_nowhere_to_reply():
+    # No sender and no group: nothing could answer it, and trying would raise.
+    env = {"timestamp": 1, "dataMessage": {"message": "hi"}}
+    assert _to_message({"params": {"envelope": env}}) is None
+
+
+def test_to_message_survives_malformed_shapes():
+    # signal-cli is another process: a wrong-shaped payload must not kill the stream.
+    malformed = [
+        [1, 2, 3],
+        "just a string",
+        {"params": "not an object"},
+        {"params": {"envelope": 7}},
+        {"params": {"envelope": {"sourceNumber": "+1", "dataMessage": "a string"}}},
+        {
+            "params": {
+                "envelope": {"sourceNumber": "+1", "dataMessage": {"message": 42}}
+            }
+        },
+        {"params": {"envelope": {"syncMessage": "a string"}}},
+        {"params": {"envelope": {"syncMessage": {"sentMessage": ["x"]}}}},
+    ]
+    for payload in malformed:
+        assert _to_message(payload) is None, payload
+
+    # A bad sub-object is ignored without losing the message itself.
+    msg = _to_message(
+        {
+            "params": {
+                "envelope": {
+                    "sourceNumber": "+1",
+                    "dataMessage": {"message": "hi", "groupInfo": "bogus"},
+                }
+            }
+        }
+    )
+    assert msg is not None
+    assert msg.text == "hi"
+    assert msg.conversation.recipient == "+1"
+
+
 def test_to_message_note_to_self():
     # Bot runs on your own number: messaging yourself arrives as a sync sentMessage.
     env = {
@@ -568,6 +678,24 @@ def test_extract_json_from_fenced_answer():
     assert obj["cron"] == "0 9 * * *"
 
 
+def test_extract_json_takes_the_first_object():
+    # A second "{" in the answer used to defeat the greedy match.
+    assert _extract_json('one {"a": 1} and another {"b": 2}') == {"a": 1}
+    assert _extract_json('{"ok": true} then prose with {curly} braces') == {"ok": True}
+    # Braces inside strings and nested objects still belong to the first object.
+    assert _extract_json('note {x} then {"p":{"deep":"}"},"n":1}') == {
+        "p": {"deep": "}"},
+        "n": 1,
+    }
+    assert _extract_json("no json here at all") is None
+    assert _extract_json("{not json}") is None
+    # A bare {} in prose parses but can't be the schedule; keep looking.
+    assert _extract_json('maybe { } — no: {"cron": "0 9 * * *"}') == {
+        "cron": "0 9 * * *"
+    }
+    assert _extract_json("empty { } only") is None
+
+
 def test_build_recurring():
     now = 1_000_000.0
     p = _build(
@@ -617,10 +745,70 @@ def test_session_kwargs_swival_override():
     assert kw["temperature"] == 0.1
 
 
+def _write_toml(tmp_path, body: str) -> Path:
+    path = tmp_path / "nbclaw.toml"
+    path.write_text(body)
+    return path
+
+
+def test_toml_allow_must_be_a_list_of_strings(tmp_path):
+    # A string here would make the sender check a substring match.
+    for body in ('allow = "+1234567890"\n', 'allow = ["+1", 2]\n'):
+        path = _write_toml(tmp_path, body)
+        with pytest.raises(SystemExit, match="must be a list of strings"):
+            build_config(["--config", str(path)])
+
+
+def test_toml_rejects_mistyped_values(tmp_path):
+    cases = [
+        ("max_turns = true\n", "an integer"),  # bool is a subclass of int
+        ('safe = "yes"\n', "true or false"),
+        ("swival = 3\n", "a table"),
+        ("mcp_servers = { a = 1 }\n", "a table of tables"),
+        ("signal_url = 8080\n", "a string"),
+        ("bogus = 1\n", "Unknown config key"),
+    ]
+    for body, expected in cases:
+        path = _write_toml(tmp_path, body)
+        with pytest.raises(SystemExit, match=expected):
+            build_config(["--config", str(path)])
+
+
+def test_toml_accepts_well_typed_values(tmp_path):
+    path = _write_toml(
+        tmp_path,
+        'allow = ["+1"]\n'
+        "allow_all = false\n"
+        "max_turns = 5\n"
+        "shutdown_timeout = 2\n"
+        'state_dir = "~/nb"\n'
+        "[swival]\n"
+        "temperature = 0.1\n",
+    )
+    cfg = build_config(["--config", str(path)])
+    assert cfg.allow == ["+1"]
+    assert cfg.allow_all is False
+    assert cfg.max_turns == 5
+    assert cfg.shutdown_timeout == 2
+    assert cfg.state_dir == Path.home() / "nb"
+    assert cfg.swival == {"temperature": 0.1}
+
+
+def test_toml_schema_covers_every_config_field():
+    # A field missing from the schema can't be set from TOML at all.
+    assert set(_TOML_SCHEMA) == {f.name for f in fields(Config)}
+
+
 # --- agent session bounding ------------------------------------------
+_DONE = Result(answer="done", exhausted=False, messages=[], report=None)
+
+
 class _FakeSession:
     def __init__(self, **kwargs):
         self.closed = False
+
+    def ask(self, prompt):
+        return _DONE
 
     def close(self):
         self.closed = True
@@ -698,3 +886,88 @@ def test_cron_sessions_do_not_leak_swival_event_loop_fds(monkeypatch):
     after = len(os.listdir("/dev/fd"))
 
     assert after - before <= 2, f"leaked {after - before} fds over 10 cron sessions"
+
+
+def test_reset_closes_an_idle_session(monkeypatch):
+    monkeypatch.setattr("nbclaw.agent_runner.Session", _FakeSession)
+    runner = AgentRunner({})
+    session = runner._session_for("user:+1")
+
+    assert runner.reset("user:+1") is True
+    assert session.closed is True
+    assert runner.reset("user:+1") is False  # nothing left to clear
+
+
+def test_reset_defers_closing_a_session_being_used(monkeypatch):
+    # Closing a session mid-ask() would pull swival state from under the worker.
+    started = threading.Event()
+    finish = threading.Event()
+
+    class BlockingSession(_FakeSession):
+        def ask(self, prompt):
+            started.set()
+            assert finish.wait(5)
+            return _DONE
+
+    monkeypatch.setattr("nbclaw.agent_runner.Session", BlockingSession)
+    runner = AgentRunner({})
+    worker = threading.Thread(target=runner._ask_blocking, args=("user:+1", "hi"))
+    worker.start()
+    try:
+        assert started.wait(5)
+        session = runner._in_use["user:+1"]
+
+        assert runner.reset("user:+1") is True
+        assert session.closed is False  # still in use — not closed yet
+        assert "user:+1" not in runner._sessions  # but the next message is fresh
+    finally:
+        finish.set()
+        worker.join(5)
+
+    assert session.closed is True  # closed once the worker handed it back
+    assert runner._retired == set()
+    assert runner._in_use == {}
+
+
+def test_reset_discards_a_session_that_is_still_being_created(monkeypatch):
+    # /clear can land while a session is being built, before it's in the cache.
+    creating = threading.Event()
+    cleared = threading.Event()
+    made = []
+
+    class SlowSession(_FakeSession):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            made.append(self)
+            creating.set()
+            assert cleared.wait(5)
+
+    monkeypatch.setattr("nbclaw.agent_runner.Session", SlowSession)
+    runner = AgentRunner({})
+    worker = threading.Thread(target=runner._ask_blocking, args=("user:+1", "hi"))
+    worker.start()
+    try:
+        assert creating.wait(5)
+        assert runner.reset("user:+1") is True
+    finally:
+        cleared.set()
+        worker.join(5)
+
+    # The call still ran, but nothing was kept for the next message.
+    assert "user:+1" not in runner._sessions
+    assert runner._creating == set()
+    assert runner._retired == set()
+    assert runner._in_use == {}
+    assert made[0].closed is True
+    assert runner.reset("user:+1") is False
+
+
+def test_close_all_closes_retired_sessions(monkeypatch):
+    monkeypatch.setattr("nbclaw.agent_runner.Session", _FakeSession)
+    runner = AgentRunner({})
+    session = runner._session_for("user:+1", in_use=True)
+    runner.reset("user:+1")  # retired, not closed: still checked out
+
+    runner.close_all()
+    assert session.closed is True
+    assert runner._retired == set()

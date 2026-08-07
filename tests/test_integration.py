@@ -13,7 +13,15 @@ import httpx
 import pytest
 
 from nbclaw.config import Config
-from nbclaw.daemon import MAX_REPLY_CHARS, Daemon, Job, split_reply
+from nbclaw.daemon import (
+    MAX_REPLY_CHARS,
+    SCHEDULER_MAX_DELAY,
+    SCHEDULER_MIN_DELAY,
+    Daemon,
+    Job,
+    split_reply,
+)
+from nbclaw.scheduler import MAX_CRONS_PER_CONVERSATION
 from nbclaw.signal_client import Conversation, IncomingMessage
 
 
@@ -142,8 +150,6 @@ def test_cron_management_is_scoped_to_conversation(tmp_path):
 
 
 def test_cron_add_rejected_when_conversation_full(tmp_path):
-    from nbclaw.scheduler import MAX_CRONS_PER_CONVERSATION
-
     d = make_daemon(tmp_path)
     conv = Conversation(recipient="+15550000001")
     for i in range(MAX_CRONS_PER_CONVERSATION):
@@ -161,10 +167,63 @@ def test_cron_add_bad_schedule(tmp_path):
     assert "x" not in d.scheduler.jobs
 
 
+def test_cron_list_is_split_when_it_gets_long(tmp_path):
+    d = make_daemon(tmp_path)
+    conv = Conversation(recipient="+15550000001")
+    for i in range(MAX_CRONS_PER_CONVERSATION):
+        d.scheduler.add(f"job{i}", "@daily", "a very long prompt " * 10, conv)
+
+    asyncio.run(d._dispatch(incoming("/cron list")))
+
+    chunks = [message for _, message in d.signal.sent]
+    assert len(chunks) > 1  # a full list doesn't fit in one Signal message
+    assert all(len(chunk) <= MAX_REPLY_CHARS for chunk in chunks)
+    listed = "".join(chunks)
+    assert "job0" in listed
+    assert f"job{MAX_CRONS_PER_CONVERSATION - 1}" in listed
+
+
 def test_unauthorized_sender_ignored(tmp_path):
     d = make_daemon(tmp_path)
     assert d._authorized(incoming("hi", source="+19998887777")) is False
     assert d._authorized(incoming("hi", source="+15550000001")) is True
+
+
+def test_authorization_never_substring_matches(tmp_path):
+    # An allowlist that isn't a list authorizes nobody at all.
+    d = make_daemon(tmp_path)
+    d.config.allow = "+15550000001"
+    assert d._authorized(incoming("hi", source="+1555")) is False
+    assert d._authorized(incoming("hi", source="+15550000001")) is False
+    assert d._authorized(incoming("hi", source="+")) is False
+
+    d.config.allow = ["+15550000001"]
+    assert d._authorized(incoming("hi", source="+1555")) is False
+    assert d._authorized(incoming("hi", source="+15550000001")) is True
+
+
+def test_scheduler_delay_waits_for_the_soonest_cron(tmp_path):
+    d = make_daemon(tmp_path)
+    conv = Conversation(recipient="+15550000001")
+    now = time.time()
+
+    assert d._scheduler_delay(now) == SCHEDULER_MAX_DELAY  # nothing scheduled
+
+    # A short interval is waited out, not rounded up to the tick.
+    d.scheduler.add("fast", "@every 5s", "tick", conv, now=now)
+    assert d._scheduler_delay(now) == pytest.approx(5.0)
+
+    d.scheduler.remove("fast")
+    d.scheduler.add("slow", "@daily", "tick", conv, now=now)
+    assert d._scheduler_delay(now) == SCHEDULER_MAX_DELAY  # distant cron
+
+    # A firing in flight puts us on the floor, so a short interval survives it.
+    d.scheduler.add("claimed", "@every 5s", "tick", conv, now=now - 60)
+    assert [j.name for j in d.scheduler.due(now)] == ["claimed"]
+    assert d._scheduler_delay(now) == SCHEDULER_MIN_DELAY
+
+    d.scheduler.complete("claimed", now=now)
+    assert d._scheduler_delay(now) == pytest.approx(5.0)
 
 
 def test_chat_message_is_queued(tmp_path):

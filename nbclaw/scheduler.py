@@ -129,9 +129,17 @@ class Scheduler:
         for item in raw.get("jobs", []):
             try:
                 job = CronJob(**item)
-                self.jobs[job.name] = job
             except TypeError as exc:
                 log.error("skipping malformed cron entry %s: %s", item, exc)
+                continue
+            if not job.conversation.deliverable:
+                # It would be claimed and then fail every tick, forever.
+                log.error(
+                    "skipping cron %r: no recipient or group id to deliver to",
+                    job.name,
+                )
+                continue
+            self.jobs[job.name] = job
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -154,14 +162,20 @@ class Scheduler:
     ) -> CronJob:
         """Schedule a job. ``next_run`` overrides the schedule (one-shot times)."""
         now = time.time() if now is None else now
+        if not conv.deliverable:
+            raise ValueError("cannot schedule a task with nowhere to deliver it")
         if self._count_for(conv.key) >= MAX_CRONS_PER_CONVERSATION:
             raise ValueError(
                 f"too many scheduled tasks for this conversation "
                 f"(limit {MAX_CRONS_PER_CONVERSATION}); remove some with /cron del"
             )
         if next_run is None:
+            next_run = next_fire(schedule, now)  # validates by construction
+        elif not once:
+            # Only a one-shot may carry a placeholder schedule it never fires
+            # from. A recurring job has to be advanceable, and better to say so
+            # now than at firing time.
             validate_schedule(schedule)
-            next_run = next_fire(schedule, now)
         job = CronJob(
             name=self._unique_name(name),
             schedule=schedule,
@@ -235,6 +249,20 @@ class Scheduler:
                 self._claimed.add(job.name)
                 ready.append(job)
         return ready
+
+    def next_firing(self, now: float | None = None) -> float | None:
+        """When the next firing is due, or None if nothing is coming.
+
+        ``now`` while a firing is in flight: its own next time isn't knowable
+        until the worker hands the job back, so a caller has to look again soon.
+        """
+        now = time.time() if now is None else now
+        if self._claimed:
+            return now
+        return min(
+            (job.next_run for job in self.jobs.values() if job.next_run > now),
+            default=None,
+        )
 
     def complete(
         self, name: str, *, created: float | None = None, now: float | None = None

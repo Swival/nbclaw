@@ -193,6 +193,53 @@ class Config:
         return kwargs
 
 
+# What every TOML key may contain, and how to say so in an error. Types have to
+# be checked rather than trusted: an `allow` written as a string, say, turns the
+# sender check into a substring match.
+_TOML_SCHEMA: dict[str, tuple[tuple[type, ...], str]] = {
+    "signal_url": ((str,), "a string"),
+    "allow": ((list,), "a list of strings"),
+    "allow_all": ((bool,), "true or false"),
+    "notify": ((str,), "a string"),
+    "provider": ((str,), "a string"),
+    "model": ((str,), "a string"),
+    "base_url": ((str,), "a string"),
+    "api_key": ((str,), "a string"),
+    "safe": ((bool,), "true or false"),
+    "max_turns": ((int,), "an integer"),
+    "instructions": ((str,), "a string"),
+    "mcp_servers": ((dict,), "a table of tables"),
+    "swival": ((dict,), "a table"),
+    "state_dir": ((str,), "a path string"),
+    "workspace_dir": ((str,), "a path string"),
+    "shutdown_timeout": ((int, float), "a number"),
+}
+
+
+def _validated(key: str, value: Any, source: Path) -> Any:
+    """Check one TOML value against :data:`_TOML_SCHEMA`, or exit saying why."""
+    entry = _TOML_SCHEMA.get(key)
+    if entry is None:
+        raise SystemExit(f"Unknown config key: {key!r} in {source}")
+    types, expected = entry
+
+    def bad() -> SystemExit:
+        return SystemExit(
+            f"Config key {key!r} in {source} must be {expected}: {value!r}"
+        )
+
+    # bool is a subclass of int, so "max_turns = true" would otherwise pass.
+    if not isinstance(value, types) or (isinstance(value, bool) and bool not in types):
+        raise bad()
+    if key == "allow" and not all(isinstance(item, str) for item in value):
+        raise bad()
+    if key == "mcp_servers" and not all(isinstance(v, dict) for v in value.values()):
+        raise bad()
+    if key in ("state_dir", "workspace_dir"):
+        return Path(value).expanduser()
+    return value
+
+
 def build_config(argv: list[str] | None = None) -> Config:
     parser = argparse.ArgumentParser(
         prog="nbclaw",
@@ -236,15 +283,8 @@ def build_config(argv: list[str] | None = None) -> Config:
     if args.config:
         with args.config.open("rb") as f:
             data = tomllib.load(f)
-        swival_table = data.pop("swival", None)
         for key, value in data.items():
-            if not hasattr(cfg, key):
-                raise SystemExit(f"Unknown config key: {key!r} in {args.config}")
-            if key in ("state_dir", "workspace_dir") and value is not None:
-                value = Path(value).expanduser()
-            setattr(cfg, key, value)
-        if isinstance(swival_table, dict):
-            cfg.swival = swival_table
+            setattr(cfg, key, _validated(key, value, args.config))
 
     # CLI overrides (only when explicitly provided).
     if args.signal_url is not None:

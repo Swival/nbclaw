@@ -13,14 +13,13 @@ from __future__ import annotations
 import datetime
 import json
 import logging
-import re
 from dataclasses import dataclass
 from typing import Any
 
 from swival import AgentError
 from swival import run as swival_run
 
-from .scheduler import fmt_time, next_fire, slugify, validate_schedule
+from .scheduler import fmt_time, next_fire, slugify
 
 log = logging.getLogger("nbclaw.nl")
 
@@ -85,14 +84,26 @@ def parse_request(
 
 
 def _extract_json(answer: str) -> dict | None:
-    match = re.search(r"\{.*\}", answer, re.DOTALL)
-    if not match:
-        return None
-    try:
-        obj = json.loads(match.group(0))
-    except json.JSONDecodeError:
-        return None
-    return obj if isinstance(obj, dict) else None
+    """Return the first non-empty JSON object embedded in a model answer.
+
+    Models wrap the object in prose, a code fence, or a second object, and it has
+    braces of its own, so brace matching can't find where it ends. Let the JSON
+    parser do that: decode at each ``{`` and take the first that works. A bare
+    ``{}`` in prose parses too, and is never the schedule.
+    """
+    decoder = json.JSONDecoder()
+    start = answer.find("{")
+    while start != -1:
+        try:
+            # Starting on a "{" means a successful decode is always an object.
+            obj, _ = decoder.raw_decode(answer, start)
+        except json.JSONDecodeError:
+            pass
+        else:
+            if obj:
+                return obj
+        start = answer.find("{", start + 1)
+    return None
 
 
 def _build(data: dict, now: float) -> ParsedSchedule:
@@ -115,8 +126,7 @@ def _build(data: dict, now: float) -> ParsedSchedule:
     if not cron:
         raise ParseError("I couldn't work out when to run that")
     try:
-        validate_schedule(cron)
-        next_fire(cron, now)  # ensure it actually produces a future time
+        next_fire(cron, now)  # validates by construction
     except ValueError as exc:
         raise ParseError(f"that schedule didn't make sense ({exc})") from exc
     return ParsedSchedule(

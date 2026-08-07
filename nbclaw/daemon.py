@@ -25,13 +25,18 @@ from dataclasses import dataclass, field
 from . import commands, nl_schedule
 from .agent_runner import AgentRunner
 from .config import Config
-from .scheduler import CronJob, Scheduler, fmt_time, validate_schedule
+from .scheduler import CronJob, Scheduler, fmt_time
 from .signal_client import Conversation, IncomingMessage, SignalClient
 
 log = logging.getLogger("nbclaw")
 
 MAX_REPLY_CHARS = 3500
 _REPLY_CHUNK_PREFIX_RESERVE = 64
+
+# Bounds on the scheduler loop's sleep. The maximum is how long a cron added
+# while it sleeps waits for its first look; the minimum stops a busy loop.
+SCHEDULER_MAX_DELAY = 15.0
+SCHEDULER_MIN_DELAY = 1.0
 
 
 def _split_command(text: str) -> tuple[str, str]:
@@ -202,18 +207,23 @@ class Daemon:
     async def _announce_online(self) -> None:
         if not self.config.notify:
             return
-        conv = Conversation(recipient=self.config.notify)
-        try:
-            await self.signal.send(conv, "nbclaw is online.")
-        except Exception as exc:
-            log.warning("could not send startup notice: %s", exc)
+        await self._safe_send(
+            Conversation(recipient=self.config.notify), "nbclaw is online."
+        )
 
     # --- authorization -------------------------------------------------
     def _authorized(self, msg: IncomingMessage) -> bool:
         if self.config.allow_all:
             return True
         allow = self.config.allow
-        return (msg.source in allow) or (msg.source_uuid in allow)
+        if not isinstance(allow, list):
+            # Config validation rejects this; authorization is still no place to
+            # be lenient, since a string would be compared character by character.
+            log.error("allowlist is %s, not a list: refusing everything", type(allow))
+            return False
+        # Compare whole entries against the sender: the other direction,
+        # `msg.source in allow`, is a substring match.
+        return any(entry in (msg.source, msg.source_uuid) for entry in allow)
 
     # --- event consumption ---------------------------------------------
     async def _consume_events(self) -> None:
@@ -253,22 +263,23 @@ class Daemon:
         cmd, rest = _split_command(text[1:])
 
         if cmd in ("help", "h", "?"):
-            await self.signal.send(conv, commands.HELP_TEXT)
+            await self._safe_send(conv, commands.HELP_TEXT)
         elif cmd == "status":
-            await self.signal.send(conv, self._status_text())
+            await self._safe_send(conv, self._status_text())
         elif cmd in ("clear", "reset", "new"):
-            had = self.agent.reset(conv.key)
-            await self.signal.send(
+            # Closing a session tears down MCP subprocesses: not on the loop.
+            had = await asyncio.to_thread(self.agent.reset, conv.key)
+            await self._safe_send(
                 conv, "context cleared." if had else "no context to clear."
             )
         elif cmd == "queue":
-            await self.signal.send(conv, self._queue_text(conv))
+            await self._safe_send(conv, self._queue_text(conv))
         elif cmd == "cancel":
-            await self.signal.send(conv, self._cancel_text(conv, rest))
+            await self._safe_send(conv, self._cancel_text(conv, rest))
         elif cmd == "cron":
             await self._handle_cron(conv, rest)
         else:
-            await self.signal.send(
+            await self._safe_send(
                 conv, f"unknown command: /{cmd}\n\n{commands.HELP_TEXT}"
             )
 
@@ -276,13 +287,13 @@ class Daemon:
         sub, sub_rest = _split_command(rest)
 
         if sub in ("list", "ls", ""):
-            await self.signal.send(conv, self._cron_list_text(conv))
+            await self._safe_send(conv, self._cron_list_text(conv))
         elif sub in ("del", "rm", "delete", "cancel"):
             name = sub_rest.strip()
             if await self._lookup_cron(conv, name) is None:
                 return
             self.scheduler.remove(name)
-            await self.signal.send(conv, f"cancelled cron '{name}'.")
+            await self._safe_send(conv, f"cancelled cron '{name}'.")
         elif sub == "run":
             name = sub_rest.strip()
             job = await self._lookup_cron(conv, name)
@@ -291,9 +302,9 @@ class Daemon:
             queued = await self._enqueue(
                 Job(job.conversation, job.prompt, "cron", label=name)
             )
-            await self.signal.send(conv, f"queued cron '{name}' as #{queued.id}.")
+            await self._safe_send(conv, f"queued cron '{name}' as #{queued.id}.")
         elif sub in ("help", "h", "?"):
-            await self.signal.send(conv, commands.HELP_TEXT)
+            await self._safe_send(conv, commands.HELP_TEXT)
         elif sub == "add" and "|" in sub_rest:
             await self._cron_add_structured(conv, sub_rest)  # power-user form
         elif sub == "add":
@@ -306,12 +317,11 @@ class Daemon:
     async def _cron_add_structured(self, conv: Conversation, body: str) -> None:
         try:
             name, schedule, prompt = commands.parse_cron_add(body)
-            validate_schedule(schedule)
             job = self.scheduler.add(name, schedule, prompt, conv)
         except ValueError as exc:
-            await self.signal.send(conv, f"cron add: {exc}")
+            await self._safe_send(conv, f"cron add: {exc}")
             return
-        await self.signal.send(
+        await self._safe_send(
             conv,
             f"scheduled '{job.name}' ({schedule}). next run: {fmt_time(job.next_run)}",
         )
@@ -319,7 +329,7 @@ class Daemon:
     async def _cron_add_nl(self, conv: Conversation, text: str) -> None:
         text = text.strip()
         if not text:
-            await self.signal.send(
+            await self._safe_send(
                 conv,
                 "tell me what to schedule, e.g.\n/cron remind me to stretch every 2 hours",
             )
@@ -334,7 +344,7 @@ class Daemon:
             )
         except nl_schedule.ParseError as exc:
             await self.signal.send_typing(conv, stop=True)
-            await self.signal.send(
+            await self._safe_send(
                 conv,
                 f"couldn't schedule that: {exc}\n\n"
                 "tip: try rephrasing, or use /cron add <name> <cron> | <prompt>",
@@ -343,7 +353,7 @@ class Daemon:
         except Exception as exc:
             await self.signal.send_typing(conv, stop=True)
             log.exception("nl schedule failed")
-            await self.signal.send(conv, f"scheduling error: {exc}")
+            await self._safe_send(conv, f"scheduling error: {exc}")
             return
         await self.signal.send_typing(conv, stop=True)
 
@@ -362,9 +372,9 @@ class Daemon:
                     parsed.name, parsed.schedule, parsed.prompt, conv
                 )
         except ValueError as exc:
-            await self.signal.send(conv, f"couldn't schedule that: {exc}")
+            await self._safe_send(conv, f"couldn't schedule that: {exc}")
             return
-        await self.signal.send(
+        await self._safe_send(
             conv,
             f"scheduled '{job.name}' — {parsed.describe()}.\n"
             f"next run: {fmt_time(job.next_run)}\n"
@@ -380,7 +390,7 @@ class Daemon:
         """
         job = self.scheduler.get_for(name, conv.key)
         if job is None:
-            await self.signal.send(conv, f"no cron named '{name}'.")
+            await self._safe_send(conv, f"no cron named '{name}'.")
         return job
 
     def _cron_list_text(self, conv: Conversation) -> str:
@@ -570,7 +580,18 @@ class Daemon:
                         cron_created=job.created,
                     )
                 )
-            await asyncio.sleep(15)
+            await asyncio.sleep(self._scheduler_delay(time.time()))
+
+    def _scheduler_delay(self, now: float) -> float:
+        """How long to sleep before looking for due crons again.
+
+        Waiting exactly as long as the next firing needs is what lets ``@every
+        10s`` fire every 10 seconds instead of being rounded up to a fixed tick.
+        """
+        firing = self.scheduler.next_firing(now)
+        if firing is None:
+            return SCHEDULER_MAX_DELAY
+        return min(max(firing - now, SCHEDULER_MIN_DELAY), SCHEDULER_MAX_DELAY)
 
     # --- helpers -------------------------------------------------------
     async def _safe_send(self, conv: Conversation, text: str) -> bool:
