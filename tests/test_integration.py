@@ -11,6 +11,7 @@ import time
 
 import httpx
 import pytest
+from swival import Result
 
 from nbclaw.config import Config
 from nbclaw.daemon import (
@@ -350,12 +351,16 @@ def test_cron_job_leaves_no_reaction(tmp_path):
 class FakeAgent:
     def __init__(self, answer="done"):
         self.answer = answer
+        self.cron_results = []
 
     async def once(self, prompt):
         return self.answer
 
     async def chat(self, key, prompt):
         return self.answer
+
+    def add_cron_result(self, key, name, task, result):
+        self.cron_results.append((key, name, task, result))
 
     def close_all(self):
         pass
@@ -427,6 +432,54 @@ def test_cron_not_finalized_when_delivery_fails(tmp_path):
     # Delivery failed: schedule not advanced and the firing is due again.
     assert d.scheduler.jobs["r"].next_run <= now
     assert [j.name for j in d.scheduler.due(now)] == ["r"]
+    assert d.agent.cron_results == []
+
+
+def test_cron_result_is_kept_even_if_finalizing_fails(tmp_path, monkeypatch):
+    d = make_daemon(tmp_path)
+    d.agent = FakeAgent()
+    conv = Conversation(recipient="+15550000001")
+
+    def disk_full(*args, **kwargs):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(d.scheduler, "complete", disk_full)
+    job = Job(conv, "tick", "cron", label="r", finalize=True)
+    with pytest.raises(OSError):
+        asyncio.run(d._run_one_job(job))
+
+    assert d.agent.cron_results == [(conv.key, "r", "tick", "done")]
+
+
+def test_chat_can_follow_up_on_a_cron_result(tmp_path, monkeypatch):
+    chat_prompts = []
+
+    class FakeSession:
+        def __init__(self, **kwargs):
+            pass
+
+        def run(self, prompt):
+            return Result("Build #42 failed in test_login.", False, [], None)
+
+        def ask(self, prompt):
+            chat_prompts.append(prompt)
+            return Result("ok", False, [], None)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("nbclaw.agent_runner.Session", FakeSession)
+    d = make_daemon(tmp_path)
+    conv = Conversation(recipient="+15550000001")
+
+    async def scenario():
+        await d._run_one_job(Job(conv, "check the CI", "cron", label="ci"))
+        await d._run_one_job(Job(conv, "which test failed?", "chat"))
+
+    asyncio.run(scenario())
+
+    assert d.signal.sent[0] == (conv.key, "[ci]\nBuild #42 failed in test_login.")
+    assert "Build #42 failed in test_login." in chat_prompts[0]
 
 
 def test_manual_cron_run_does_not_finalize(tmp_path):

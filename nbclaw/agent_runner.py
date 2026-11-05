@@ -7,8 +7,11 @@ trying to be concurrency-safe across many simultaneous runs. It does have to
 survive ``/clear`` arriving on the event loop while the worker is mid-``ask()``.
 
 Each conversation keeps its own long-lived ``Session`` so chat context carries
-across messages. Cron jobs run as independent one-shots and never touch chat
-context.
+across messages.
+
+Crons run in throwaway sessions so their work doesn't clutter the chat.
+What they post still lands in the chat, though, so it's passed to the model
+along with the conversation's next message.
 """
 
 from __future__ import annotations
@@ -16,9 +19,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
+from collections import deque
 from typing import Any
 
 from swival import AgentError, Result, Session
+
+from .scheduler import fmt_time
 
 log = logging.getLogger("nbclaw.agent")
 
@@ -26,6 +33,12 @@ log = logging.getLogger("nbclaw.agent")
 # 1:1 number). Past the cap the least-recently-used session is evicted so memory
 # and per-session MCP processes can't grow without bound.
 MAX_CHAT_SESSIONS = 32
+
+# How many cron results we hold until a conversation's next message, and how
+# much of each.
+# This keeps an hourly cron in a quiet chat from flooding the next prompt.
+MAX_PENDING_CRON_RESULTS = 5
+MAX_CRON_RESULT_CHARS = 4000
 
 
 def _setup_and_report_mcp(session: Session) -> None:
@@ -62,6 +75,7 @@ class AgentRunner:
         self._retired: set[Session] = set()
         # Sessions still being built. reset() drops the key to disown one.
         self._creating: set[str] = set()
+        self._cron_results: dict[str, deque[str]] = {}
         # The containers above are touched by both the event loop and the worker.
         self._lock = threading.Lock()
 
@@ -139,6 +153,17 @@ class AgentRunner:
             evicted.append((victim, self._sessions.pop(victim)))
         return evicted
 
+    def add_cron_result(self, key: str, name: str, task: str, result: str) -> None:
+        """Remember a cron result posted to ``key``, for its next chat message."""
+        if len(result) > MAX_CRON_RESULT_CHARS:
+            result = result[:MAX_CRON_RESULT_CHARS] + "\n[truncated]"
+        entry = f'Task "{name}" at {fmt_time(time.time())}: {task}\nResult:\n{result}'
+        with self._lock:
+            pending = self._cron_results.setdefault(
+                key, deque(maxlen=MAX_PENDING_CRON_RESULTS)
+            )
+            pending.append(entry)
+
     def reset(self, key: str) -> bool:
         """Drop a conversation's context. Returns True if there was one.
 
@@ -147,11 +172,12 @@ class AgentRunner:
         it finishes.
         """
         with self._lock:
+            had_results = self._cron_results.pop(key, None) is not None
             session = self._sessions.pop(key, None)
             if session is None:
                 had_pending = key in self._creating
                 self._creating.discard(key)
-                return had_pending
+                return had_pending or had_results
             if self._in_use.get(key) is session:
                 self._retired.add(session)
                 return True
@@ -172,10 +198,16 @@ class AgentRunner:
     # --- blocking primitives (run inside the executor) -----------------
     def _ask_blocking(self, key: str, prompt: str) -> str:
         session = self._session_for(key, in_use=True)
+        with self._lock:
+            cron_results = list(self._cron_results.get(key, ()))
         try:
-            result = session.ask(prompt)
+            result = session.ask(_with_cron_results(cron_results, prompt))
         finally:
             self._release(key, session)
+        # Clear them only once the ask worked.
+        # A failed turn is thrown away, so they have to go out with the next one.
+        with self._lock:
+            self._cron_results.pop(key, None)
         return _answer_text(result)
 
     def _once_blocking(self, prompt: str) -> str:
@@ -204,8 +236,22 @@ class AgentRunner:
             self._retired.clear()
             self._in_use.clear()
             self._creating.clear()  # nothing built after this gets cached
+            self._cron_results.clear()
         for session in sessions:
             _safe_close(session)
+
+
+def _with_cron_results(cron_results: list[str], prompt: str) -> str:
+    # If the context fills up, swival trims long messages from the end.
+    # Putting the user's message first means it's cron output that gets trimmed.
+    if not cron_results:
+        return prompt
+    return (
+        f"{prompt}\n\n---\n"
+        "For context: since my last message, you ran these scheduled tasks on "
+        "your own and posted their results in this chat.\n\n"
+        + "\n\n".join(cron_results)
+    )
 
 
 def _answer_text(result: Result) -> str:

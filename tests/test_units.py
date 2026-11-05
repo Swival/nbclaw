@@ -12,7 +12,12 @@ from pathlib import Path
 
 import pytest
 
-from nbclaw.agent_runner import MAX_CHAT_SESSIONS, AgentRunner
+from nbclaw.agent_runner import (
+    MAX_CHAT_SESSIONS,
+    MAX_CRON_RESULT_CHARS,
+    MAX_PENDING_CRON_RESULTS,
+    AgentRunner,
+)
 from nbclaw.commands import CronAddError, parse_cron_add
 from nbclaw.config import _TOML_SCHEMA, Config, build_config
 from nbclaw.nl_schedule import ParseError, _build, _extract_json
@@ -971,3 +976,75 @@ def test_close_all_closes_retired_sessions(monkeypatch):
     runner.close_all()
     assert session.closed is True
     assert runner._retired == set()
+
+
+def _recording_runner(monkeypatch):
+    prompts = []
+
+    class RecordingSession(_FakeSession):
+        def ask(self, prompt):
+            prompts.append(prompt)
+            return _DONE
+
+    monkeypatch.setattr("nbclaw.agent_runner.Session", RecordingSession)
+    return AgentRunner({}), prompts
+
+
+def test_cron_result_goes_with_the_next_message_of_its_conversation(monkeypatch):
+    runner, prompts = _recording_runner(monkeypatch)
+    runner.add_cron_result("user:+1", "standup", "summarize commits", "3 commits")
+
+    runner._ask_blocking("user:+2", "hi")
+    runner._ask_blocking("user:+1", "what was the second one?")
+    runner._ask_blocking("user:+1", "thanks")
+
+    assert prompts[0] == "hi"
+    # The question has to come first, or swival may trim it away on a full context.
+    assert prompts[1].startswith("what was the second one?")
+    assert "summarize commits" in prompts[1]
+    assert "3 commits" in prompts[1]
+    assert prompts[2] == "thanks"
+
+    runner.add_cron_result("user:+3", "standup", "summarize commits", "2 commits")
+    assert runner.reset("user:+3") is True
+    runner._ask_blocking("user:+3", "hi")
+    assert prompts[3] == "hi"
+
+
+def test_cron_result_backlog_is_bounded(monkeypatch):
+    runner, prompts = _recording_runner(monkeypatch)
+    for i in range(MAX_PENDING_CRON_RESULTS + 1):
+        runner.add_cron_result(
+            "user:+1", f"t{i}", "dump", "x" * MAX_CRON_RESULT_CHARS * 2
+        )
+
+    runner._ask_blocking("user:+1", "hi")
+
+    assert prompts[0].count('Task "') == MAX_PENDING_CRON_RESULTS
+    assert 'Task "t0"' not in prompts[0]
+    assert prompts[0].count("[truncated]") == MAX_PENDING_CRON_RESULTS
+
+
+def test_failed_ask_keeps_cron_results_unless_cleared(monkeypatch):
+    runner = AgentRunner({})
+    prompts = []
+    clear_during_ask = False
+
+    class FailingSession(_FakeSession):
+        def ask(self, prompt):
+            prompts.append(prompt)
+            if clear_during_ask:
+                runner.reset("user:+1")
+            raise RuntimeError("model down")
+
+    monkeypatch.setattr("nbclaw.agent_runner.Session", FailingSession)
+    runner.add_cron_result("user:+1", "standup", "summarize commits", "3 commits")
+
+    with pytest.raises(RuntimeError):
+        runner._ask_blocking("user:+1", "what was that?")
+    clear_during_ask = True
+    with pytest.raises(RuntimeError):
+        runner._ask_blocking("user:+1", "what was that?")
+
+    assert "3 commits" in prompts[1]
+    assert runner._cron_results == {}

@@ -544,7 +544,6 @@ class Daemon:
             if job.mode == "cron":
                 log.info("running cron '%s'", job.label)
                 answer = await self.agent.once(job.prompt)
-                answer = f"[{job.label}]\n{answer}"
             else:
                 answer = await self.agent.chat(conv.key, job.prompt)
         except Exception as exc:
@@ -552,7 +551,11 @@ class Daemon:
             answer = f"agent error: {exc}"
         finally:
             await self.signal.send_typing(conv, stop=True)
-        delivered = await self._safe_send(conv, answer)
+        reply = f"[{job.label}]\n{answer}" if job.mode == "cron" else answer
+        delivered = await self._safe_send(conv, reply)
+        # Remember it before finalizing, which writes to disk and can fail.
+        if delivered and job.mode == "cron":
+            self.agent.add_cron_result(conv.key, job.label, job.prompt, answer)
         if job.origin is not None:
             await self.signal.send_reaction(job.origin, remove=True)
         # Advance/remove the schedule only once the firing was actually
